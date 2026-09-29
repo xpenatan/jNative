@@ -1,0 +1,22 @@
+name: Snapshot
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jnative-snapshot-publishing
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    name: Build and Publish Snapshot
+    uses: ./.github/workflows/workflow_build_and_upload.yml
+    with:
+      isRelease: false
+    secrets: inherit
