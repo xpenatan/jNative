@@ -1,0 +1,4 @@
+# Representation-aware Java construction adapters: target owner/name/descriptor, helper owner/name/descriptor
+java/lang/String	<init>	([B)V	com/github/xpenatan/jnative/classlib/java/lang/NativeStrings	initialize	(Ljava/lang/String;[B)V
+java/lang/String	<init>	([BII)V	com/github/xpenatan/jnative/classlib/java/lang/NativeStrings	initialize	(Ljava/lang/String;[BII)V
+java/lang/String	<init>	([BLjava/nio/charset/Charset;)V	com/github/xpenatan/jnative/classlib/java/lang/NativeStrings	initialize	(Ljava/lang/String;[BLjava/nio/charset/Charset;)V

@@ -1,0 +1,16 @@
+.gradle/
+build/
+out/
+bin/
+.idea/
+*.iml
+*.class
+*.log
+*.hprof
+local.properties
+.DS_Store
+/.plan/
+
+
+# Private release diagnostics; retain outside build output.
+.private-symbols/

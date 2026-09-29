@@ -1,0 +1,18 @@
+[versions]
+jNativeGroup = "com.github.xpenatan.jNative"
+jNativeRelease = "0.1.0"
+jNativeSnapshot = "0.1.0-SNAPSHOT"
+java = "25"
+easyPublishing = "0.1.2"
+junitJupiter = "5.13.4"
+junitPlatform = "1.13.4"
+asm = "9.10.1"
+
+[libraries]
+asm-tree = { module = "org.ow2.asm:asm-tree", version.ref = "asm" }
+asm-analysis = { module = "org.ow2.asm:asm-analysis", version.ref = "asm" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junitJupiter" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher", version.ref = "junitPlatform" }
+
+[plugins]
+easyPublishing = { id = "com.github.xpenatan.easy-publishing", version.ref = "easyPublishing" }

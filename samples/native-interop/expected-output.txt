@@ -1,0 +1,10 @@
+Execution: native C/C++
+C addition: 42
+C integer wrap: -2147483648
+C++ weighted average: 12.5
+Hello, Java 🌎 — from C++
+C unsigned-byte checksum: 258
+Original bytes: 0,1,2,-1
+C++ reversed copy: -1,2,1,0
+Copy survives GC: true
+Caught C++ error: weight must be between 0 and 1

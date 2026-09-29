@@ -1,0 +1,110 @@
+name: Build and Upload
+
+on:
+  workflow_call:
+    inputs:
+      isRelease:
+        required: true
+        type: boolean
+      autoPublish:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CENTRAL_PORTAL_USERNAME:
+        required: true
+      CENTRAL_PORTAL_PASSWORD:
+        required: true
+      PGP_SECRET:
+        required: false
+      PGP_PASSPHRASE:
+        required: false
+    outputs:
+      releaseVersion:
+        description: Release version from the Gradle version catalog.
+        value: ${{ jobs.publish.outputs.releaseVersion }}
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and Upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      releaseVersion: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+
+      - name: Change wrapper permissions
+        run: chmod +x ./gradlew
+
+      - name: Read release version
+        id: version
+        shell: bash
+        run: |
+          version="$(./gradlew -q printReleaseVersion)"
+          if [[ -z "$version" || "$version" == *SNAPSHOT* ]]; then
+            echo "Expected a release version in gradle/libs.versions.toml."
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests
+        run: ./gradlew :jNative:compiler:test :jNative:core:test --stacktrace
+
+      - name: Prepare release staging files
+        if: ${{ inputs.isRelease }}
+        env:
+          SIGNING_KEY: ${{ secrets.PGP_SECRET }}
+          SIGNING_PASSWORD: ${{ secrets.PGP_PASSPHRASE }}
+        run: ./gradlew prepareRelease --stacktrace
+
+      - name: Upload release staging files artifact
+        if: ${{ inputs.isRelease }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-staging-${{ steps.version.outputs.value }}-${{ github.run_number }}
+          path: build/staging-deploy/
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ inputs.isRelease }}
+        env:
+          CENTRAL_PORTAL_USERNAME: ${{ secrets.CENTRAL_PORTAL_USERNAME }}
+          CENTRAL_PORTAL_PASSWORD: ${{ secrets.CENTRAL_PORTAL_PASSWORD }}
+          SIGNING_KEY: ${{ secrets.PGP_SECRET }}
+          SIGNING_PASSWORD: ${{ secrets.PGP_PASSPHRASE }}
+          CENTRAL_PUBLISHING_TYPE: ${{ inputs.autoPublish && 'AUTOMATIC' || 'USER_MANAGED' }}
+        run: ./gradlew publishRelease --stacktrace
+
+      - name: Prepare snapshot staging files
+        if: ${{ !inputs.isRelease }}
+        run: ./gradlew prepareSnapshot --stacktrace
+
+      - name: Upload snapshot staging files artifact
+        if: ${{ !inputs.isRelease }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-deploy-${{ github.run_number }}
+          path: build/snapshot-deploy/
+          if-no-files-found: error
+
+      - name: Publish snapshot
+        if: ${{ !inputs.isRelease }}
+        env:
+          CENTRAL_PORTAL_USERNAME: ${{ secrets.CENTRAL_PORTAL_USERNAME }}
+          CENTRAL_PORTAL_PASSWORD: ${{ secrets.CENTRAL_PORTAL_PASSWORD }}
+        run: ./gradlew publishSnapshot --stacktrace
