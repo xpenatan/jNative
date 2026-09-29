@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      autoPublish:
+        description: Automatically publish the Central Portal deployment after validation.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jnative-release-publishing
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and Publish Release
+    uses: ./.github/workflows/workflow_build_and_upload.yml
+    with:
+      isRelease: true
+      autoPublish: ${{ inputs.autoPublish }}
+    secrets: inherit
+
+  tag:
+    name: Create Release Tag
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create Git tag
+        uses: actions/github-script@v9
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.releaseVersion }}
+        with:
+          script: |
+            const version = process.env.RELEASE_VERSION;
+            if (!version) throw new Error('The release version is missing.');
+            const repository = { owner: context.repo.owner, repo: context.repo.repo };
+            try {
+              const existing = await github.rest.git.getRef({ ...repository, ref: `tags/${version}` });
+              if (existing.data.object.sha !== context.sha) {
+                throw new Error(`Tag ${version} already points to another object.`);
+              }
+              core.info(`Tag ${version} already exists at this commit.`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.git.createRef({ ...repository, ref: `refs/tags/${version}`, sha: context.sha });
+            }

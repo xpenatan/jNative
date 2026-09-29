@@ -1,0 +1,10 @@
+Created: 1
+Initial health: 100
+After damage: 75
+Description: Ada: 75
+Runtime type matches: true
+Volatile field: true
+Method parameter: int
+Health after GC: 75
+Caught target error: damage cannot be negative
+Final field write rejected

@@ -1,0 +1,7 @@
+Execution: native C/C++
+Workers: 3
+Callbacks completed: 12
+Returned UTF-16 units: 132
+ThreadLocal order and GC: passed
+Caught callback error: rejected by Java callback
+Native workers joined and handles released
