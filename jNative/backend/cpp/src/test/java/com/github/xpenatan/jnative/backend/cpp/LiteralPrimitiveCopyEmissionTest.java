@@ -54,6 +54,31 @@ class LiteralPrimitiveCopyEmissionTest {
                     static void large(float[] source, float[] target) {
                         System.arraycopy(source, 0, target, 0, 65);
                     }
+                    static void row(float[][] source, float[] target) {
+                        System.arraycopy(source[0], 0, target, 0, 8);
+                    }
+                    static void three(float[][][] source, float[] target) {
+                        System.arraycopy(source[0][0], 0, target, 0, 8);
+                    }
+                    static void castLocal(Object source, float[] target) {
+                        float[][] rows = (float[][]) source;
+                        float[] output = target;
+                        System.arraycopy(rows[0], 0, output, 0, 8);
+                    }
+                    static void nullable(float[][] source, float[] target, boolean choose) {
+                        float[][] rows = choose ? source : null;
+                        System.arraycopy(rows[0], 0, target, 0, 8);
+                    }
+                    static void mixed(float[][] floats, int[][] integers, float[] target, boolean choose) {
+                        Object[] rows = choose ? floats : integers;
+                        System.arraycopy(rows[0], 0, target, 0, 8);
+                    }
+                    static void erased(Object[] source, float[] target) {
+                        System.arraycopy(source[0], 0, target, 0, 8);
+                    }
+                    static void outer(float[][][] source, float[][] target) {
+                        System.arraycopy(source[0], 0, target, 0, 8);
+                    }
                     public static void main(String[] args) {
                         float[] source = new float[72], target = new float[72];
                         literal(source, 1, target, 2);
@@ -62,11 +87,16 @@ class LiteralPrimitiveCopyEmissionTest {
                         references(new Object[20], new Object[20]);
                         variable(source, target, 5); merged(source, target, true, 7);
                         large(source, target);
+                        float[][] rows = {source};
+                        row(rows, target); three(new float[][][]{rows}, target);
+                        castLocal(rows, target); nullable(rows, target, true);
+                        mixed(rows, new int[][]{new int[72]}, target, true);
+                        erased(rows, target); outer(new float[][][]{new float[8][]}, new float[8][]);
                     }
                 }
                 """);
         assertEquals(0, ToolProvider.getSystemJavaCompiler().run(null, null, null,
-                "-g", "-d", directory.toString(), source.toString()));
+                "-g:none", "-d", directory.toString(), source.toString()));
         var request = new NativeBuildRequest(List.of(directory), "LiteralCopies", directory.resolve("out"),
                 null, null, "literal-copies", BuildType.DEBUG, false);
         var sources = new CppEmitter().emit(new BytecodeCompiler().compile(request), request);
@@ -100,6 +130,10 @@ class LiteralPrimitiveCopyEmissionTest {
             assertTrue(body(cpp, method).contains("<= 64"), body(cpp, method));
         }
         assertTrue(body(cpp, "large").contains("<= 64"), cpp);
+        for(String method : List.of("row", "three", "castLocal", "nullable"))
+            assertTrue(body(cpp, method).contains("::jnative::bounded_primitive_array_copy<float, 8>("), body(cpp, method));
+        for(String method : List.of("mixed", "erased", "outer"))
+            assertFalse(body(cpp, method).contains("bounded_primitive_array_copy"), body(cpp, method));
     }
 
     private static String body(String cpp, String method) {

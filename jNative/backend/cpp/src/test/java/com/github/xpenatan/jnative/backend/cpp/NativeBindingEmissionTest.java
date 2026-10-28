@@ -17,6 +17,57 @@ import static org.objectweb.asm.Opcodes.*;
 class NativeBindingEmissionTest {
     @TempDir Path directory;
 
+    @Test void boundedPlatformConstructorsRemoveRootsButCollectingSuperCallsKeepThem() throws Exception {
+        Path source = directory.resolve("Demo.java");
+        Files.writeString(source, """
+                public class Demo {
+                    static class Plain {
+                        Object value;
+                        Plain(Object value) { this.value = value; }
+                    }
+                    static class Numeric extends Number {
+                        int value;
+                        Numeric(int value) { this.value = value; }
+                        public int intValue() { return value; }
+                        public long longValue() { return value; }
+                        public float floatValue() { return value; }
+                        public double doubleValue() { return value; }
+                    }
+                    static class CollectingBase {
+                        CollectingBase() { System.gc(); }
+                    }
+                    static class Collecting extends CollectingBase {
+                        Object value;
+                        Collecting(Object value) { this.value = value; }
+                    }
+                    static class WithCause extends RuntimeException {
+                        WithCause(Throwable cause) { super(cause); }
+                    }
+                    public static void main(String[] args) {
+                        new Plain(args); new Numeric(7); new Collecting(args);
+                        new WithCause(new RuntimeException());
+                    }
+                }
+                """);
+        assertEquals(0, ToolProvider.getSystemJavaCompiler().run(null, null, null,
+                "-g", "-d", directory.toString(), source.toString()));
+        var request = request();
+        var sources = new CppEmitter().emit(new BytecodeCompiler().compile(request), request);
+        for(String name : List.of("Plain", "Numeric", "Collecting", "WithCause")) {
+            String cpp = sources.get("classes/Demo_" + name + ".cpp");
+            int start = cpp.indexOf("void Demo_" + name + "::initialize");
+            assertTrue(start >= 0, cpp);
+            String constructor = cpp.substring(start, cpp.indexOf("\n}", start));
+            boolean collecting = name.equals("Collecting") || name.equals("WithCause");
+            assertEquals(collecting, constructor.contains("RootFrame<"), constructor);
+            assertEquals(collecting, constructor.contains("poll_if_requested"), constructor);
+            String effect = sources.get("method-effects.tsv").lines()
+                    .filter(line -> line.startsWith("Demo$" + name + ".<init>("))
+                    .findFirst().orElseThrow();
+            assertEquals(Boolean.toString(!collecting), effect.split("\t")[1], effect);
+        }
+    }
+
     @Test void managedBindingsUseRootsDispatchAndTypedFieldsInBothEmitters() throws Exception {
         fixture(true);
         var request = request();
@@ -46,6 +97,32 @@ class NativeBindingEmissionTest {
         assertTrue(cpp.contains("::jnative::JavaNativeRegion native_call;"));
         assertTrue(cpp.contains("::external_driver(handle0.id())"));
         assertTrue(sources.get("jnative_imports.h").contains("int32_t external_driver(jn_handle);"));
+    }
+
+    @Test void builtInBindingsRetainConcreteCallbacksAndConstantFieldOffsets() throws Exception {
+        fixture(true);
+        ClassNode owner = new ClassNode();
+        new ClassReader(Files.readAllBytes(directory.resolve("Demo.class"))).accept(owner, 0);
+        boolean changed = false;
+        for(var method : owner.methods) {
+            if(method.invisibleAnnotations == null) continue;
+            for(AnnotationNode annotation : method.invisibleAnnotations) {
+                if(!annotation.desc.equals("Lcom/github/xpenatan/jnative/interop/NativeImport;")) continue;
+                annotation.values.add("runtimeOnly");
+                annotation.values.add(true);
+                changed = true;
+            }
+        }
+        assertTrue(changed);
+        ClassWriter writer = new ClassWriter(0);
+        owner.accept(writer);
+        Files.write(directory.resolve("Demo.class"), writer.toByteArray());
+        var request = request();
+        String cpp = new CppEmitter().emit(new BytecodeCompiler().compile(request), request).get("classes/Demo.cpp");
+        assertTrue(cpp.contains("[](::jnative::Object* receiver)"), cpp);
+        assertFalse(cpp.contains("+[]"), cpp);
+        assertTrue(cpp.contains("::jnative::BoundNativeFieldAccess<"), cpp);
+        assertFalse(cpp.contains("::jnative::NativeFieldAccess<"), cpp);
     }
 
     @Test void effectsUseValidatedBoundedMetadata() throws Exception {
@@ -93,6 +170,7 @@ class NativeBindingEmissionTest {
         Files.writeString(source, """
                 abstract class Base { public abstract int read(Object value); }
                 class Child extends Base { public int read(Object value) { return 11; } }
+                class OtherChild extends Base { public int read(Object value) { return 12; } }
                 class Parent { public int value() { return 22; } }
                 class Middle extends Parent {}
                 class Leaf extends Middle { public int value() { return 33; } }
@@ -101,11 +179,12 @@ class NativeBindingEmissionTest {
                     default int chosen() { return 44; }
                 }
                 class FaceImpl implements Face { public int apply(Object value) { return 55; } }
-                class InheritedDefault implements Face { public int apply(Object value) { return 66; } }
+                class InheritedDefault extends FaceImpl {}
                 public class Demo {
                     static int driver(Base base, Middle inherited, Face face, InheritedDefault defaults, Object object) { return 0; }
                     static int factory() { return 77; }
                     public static void main(String[] args) {
+                        new OtherChild();
                         driver(new Child(), new Leaf(), new FaceImpl(), new InheritedDefault(), new Object());
                     }
                 }
@@ -163,6 +242,77 @@ class NativeBindingEmissionTest {
         assertTrue(sources.get("classes/Parent.hpp").contains("virtual std::int32_t value()"));
         assertFalse(new MethodEffects(program, call -> false).boundedAfterInitialization(
                 new Program.MethodId("Demo", "driver", nativeMethod.desc)));
+
+        // Built-in callbacks use the ordinary closed-program proof, including
+        // interface implementations. Polymorphic and runtime-owned targets keep dispatch.
+        binding.values.add("runtimeOnly");
+        binding.values.add(true);
+        writer = new ClassWriter(0);
+        owner.accept(writer);
+        Files.write(directory.resolve("Demo.class"), writer.toByteArray());
+        program = new BytecodeCompiler().compile(request);
+        sources = new CppEmitter().emit(program, request);
+        driver = body(sources.get("classes/Demo.cpp"), "driver");
+        assertTrue(driver.contains("static_cast<::generated::Leaf*>(::jnative::require_non_null(receiver))->Leaf::value()"), driver);
+        assertTrue(driver.contains("static_cast<::generated::FaceImpl*>(::jnative::require_non_null(receiver))->FaceImpl::apply(arg0)"), driver);
+        assertTrue(driver.contains("static_cast<::generated::Base*>(::jnative::require_non_null(receiver))->read(arg0)"), driver);
+        assertFalse(driver.contains("->Child::read") || driver.contains("->OtherChild::read"), driver);
+        assertFalse(driver.contains("+[]"), driver);
+        assertTrue(driver.contains(">(" + names.call(dispatchedCallbacks.get(2)) + ")"), driver);
+
+        binding.values.addAll(List.of("callbacksSynchronous", true, "boundedCallbacks", true));
+        writer = new ClassWriter(0);
+        owner.accept(writer);
+        Files.write(directory.resolve("Demo.class"), writer.toByteArray());
+        sources = new CppEmitter().emit(new BytecodeCompiler().compile(request), request);
+        driver = body(sources.get("classes/Demo.cpp"), "driver");
+        assertTrue(driver.contains("make_runtime_callback("), driver);
+        assertTrue(driver.contains("RootFrame<2> callback_roots; callback_roots.slot(0) = receiver; "
+                + "callback_roots.slot(1) = arg0; return static_cast<::generated::Base*"), driver);
+        assertTrue(driver.contains("case ::generated::Child::class_id:"), driver);
+        assertTrue(driver.contains("case ::generated::OtherChild::class_id:"), driver);
+    }
+
+    @Test void runtimeHashAttemptsHonorGeneratedOverridesAndEffectiveBindings() throws Exception {
+        Path source = directory.resolve("Demo.java");
+        Files.writeString(source, """
+                import java.util.HashMap;
+                public class Demo {
+                    static class Plain {}
+                    static class Collecting {
+                        public int hashCode() { System.gc(); return 1; }
+                    }
+                    public static void main(String[] args) {
+                        HashMap<Object, Object> map = new HashMap<>();
+                        Object plain = new Plain(), collecting = new Collecting();
+                        map.put(plain, plain); map.put(collecting, collecting);
+                        System.out.println(map.get(plain) == plain && map.get(collecting) == collecting);
+                    }
+                }
+                """);
+        assertEquals(0, ToolProvider.getSystemJavaCompiler().run(null, null, null,
+                "-g", "-d", directory.toString(), source.toString()));
+        var request = request();
+        Program program = new BytecodeCompiler().compile(request);
+        String hash = new CppEmitter().emit(program, request).get("classes/java/util/HashMap.cpp");
+        assertNotNull(hash);
+        int plain = hash.indexOf("case ::generated::Demo_Plain::class_id:");
+        assertTrue(plain >= 0, hash);
+        assertTrue(hash.startsWith("return ::jnative::try_object_hash", hash.indexOf("return ", plain)), hash);
+        assertTrue(hash.contains("default: return receiver->type_id() == 0 && ::jnative::try_object_hash"), hash);
+        assertFalse(hash.contains("case ::generated::Demo_Collecting::class_id:"), hash);
+
+        var targets = new LinkedHashMap<>(program.bindings().targets());
+        var id = new Program.MethodId("java/lang/Object", "hashCode", "()I");
+        var original = targets.get(id);
+        var replacement = new NativeBinding("custom_hash", "custom_hash.hpp", true, false, false,
+                List.of(), List.of(), List.of(), false, true, false, true, false);
+        targets.put(id, new PlatformBindings.Target(id, original.helper(), original.instance(), replacement));
+        var bindings = SubstitutionRegistry.class.getDeclaredField("bindings");
+        bindings.setAccessible(true);
+        bindings.set(program.substitutions(), new PlatformBindings.Table(targets, program.bindings().fields()));
+        hash = new CppEmitter().emit(program, request).get("classes/java/util/HashMap.cpp");
+        assertFalse(hash.contains("try_object_hash"), hash);
     }
 
     @Test void platformStaticFieldsRouteThroughAnnotatedHelpersInBothEmitters() throws Exception {
@@ -207,6 +357,7 @@ class NativeBindingEmissionTest {
         Files.writeString(source, """
                 public class Demo {
                     static int quantize(float value) { return Math.round(Math.min(1, Math.max(0, value)) * 255); }
+                    static int initializationMarker = 1;
                     static double roundedRoot(double value) { return Math.floor(Math.sqrt(value)) + Math.ceil(value); }
                     static float bits(int value) { return Float.intBitsToFloat(value); }
                     static void branching(float[] source, float[] target, int count) {
@@ -308,13 +459,22 @@ class NativeBindingEmissionTest {
         Program program = new BytecodeCompiler().compile(request);
         Map<String, String> sources = new CppEmitter().emit(program, request);
         MethodEffects effects = new MethodEffects(program, call -> false);
-        Set<String> drivers = Set.of("putNative", "findNative", "removeNative", "clearNative");
+        Set<String> drivers = Set.of("putNative", "findNative", "lookupNative", "removeNative", "clearNative");
         for(String owner : List.of("java/util/HashMap", "java/util/TreeMap")) {
             var methods = program.methods().values().stream()
                     .filter(method -> method.id().owner().equals(owner) && drivers.contains(method.id().name())).toList();
             assertEquals(4, methods.size(), owner);
             String cpp = sources.get("classes/" + owner + ".cpp");
             assertNotNull(cpp, "Missing source for " + owner + ": " + sources.keySet());
+            if(owner.equals("java/util/HashMap")) {
+                int start = cpp.indexOf("\n::jnative::Object* HashMap::put(");
+                assertTrue(start >= 0, cpp);
+                String wrapper = cpp.substring(start, cpp.indexOf("\n}", start));
+                assertTrue(wrapper.contains("return HashMap::putNative("), wrapper);
+                assertFalse(wrapper.contains("collection_pending()"), wrapper);
+                assertFalse(wrapper.contains("poll_with_roots("), wrapper);
+                assertFalse(wrapper.contains("gc_roots"), wrapper);
+            }
             for(var method : methods) {
                 NativeBinding binding = method.nativeBinding();
                 assertTrue(binding.managesRoots(), method.id().toString());

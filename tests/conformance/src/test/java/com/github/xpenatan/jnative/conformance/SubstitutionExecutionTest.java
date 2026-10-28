@@ -215,6 +215,11 @@ class SubstitutionExecutionTest {
                             map.put("a", 9);
                             System.out.println(map.get(new String("a")));
                             System.out.println(RuntimePatches.calls > before);
+                            String cached = new String("a");
+                            cached.hashCode();
+                            int beforeCached = RuntimePatches.calls;
+                            if (map.get(cached) != 9 || RuntimePatches.calls != beforeCached + 1)
+                                throw new AssertionError();
                             try { Integer.parseInt("bad"); }
                             catch(NumberFormatException e) { System.out.println(e.getMessage().startsWith("selected:")); }
                             byte[] data = {1, 2, 3, 4};

@@ -73,6 +73,16 @@ public class ArrayList<E> extends AbstractList<E>
         return previous;
     }
 
+    @Override
+    public boolean add(E value) {
+        if(count == Integer.MAX_VALUE) throw new OutOfMemoryError();
+        if(count == values.length) grow(count + 1);
+        values[count] = value;
+        ++count;
+        ++modCount;
+        return true;
+    }
+
     public void add(int index, E value) {
         if(index < 0 || index > count) throw new IndexOutOfBoundsException();
         if(count == Integer.MAX_VALUE) throw new OutOfMemoryError();

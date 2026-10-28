@@ -34,7 +34,7 @@ class HardeningTest {
                             @NativeExport("edge_sum") static double add(double a, double b) { return a + b; }
                             static double separate(double a, double b, double c) { return a * b + c; }
                             public static void main(String[] args) {
-                                if (args.length == 0) args = new String[]{"OlÃ¡ Î© ðŸŒŽ æ—¥æœ¬èªž"};
+                                if (args.length == 0) args = new String[]{"Olá Ω 🌎 日本語"};
                                 System.out.println(args[0]); System.out.println(args[0].length());
                                 double[] doubles = {Double.MIN_VALUE, Double.MIN_VALUE * 2, Double.MIN_NORMAL,
                                     Double.MAX_VALUE, 0.0, -0.0, 1e-7, 0.001, 1e7, 1e23, 1.0 / 3,
@@ -91,7 +91,7 @@ class HardeningTest {
                         List.of(ProcessHarness.java(), "-cp", classes.toString(), "Edges"),
                         Duration.ofSeconds(20));
         var result =
-                NativeBuilder.create()
+                ProcessHarness.behavioralBuilder()
                         .classpath(classes)
                         .mainClass("Edges")
                         .nativeFile(cpp)

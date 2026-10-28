@@ -248,6 +248,26 @@ void transfer_elements(OrdinaryField<T>* array, std::uint8_t* buffer, std::int32
 template<class T, bool Write>
 void transfer_direct(ByteBuffer* buffer, Object* object, std::int32_t offset, std::int32_t count,
         std::int32_t position) {
+    if (borrowed_confined_array<T>(object)) {
+        if (!count) return;
+        auto elements = static_cast<ConfinedPrimitiveArray<T>*>(object)->elements.get() + offset;
+        auto data = buffer->storage->data() + buffer->offset + static_cast<std::size_t>(position) * sizeof(T);
+        if (sizeof(T) == 1 || (buffer->little_endian.get() != 0) == host_little_endian()) {
+            const auto bytes = static_cast<std::size_t>(count) * sizeof(T);
+            if (Write) std::memmove(data, elements, bytes);
+            else std::memmove(elements, data, bytes);
+        } else {
+            // Confined array storage is plain, but views can still be unaligned.
+            auto array_bytes = reinterpret_cast<unsigned char*>(elements);
+            for (std::int32_t i = 0; i < count; ++i)
+                for (std::size_t byte = 0; byte < sizeof(T); ++byte) {
+                    auto index = static_cast<std::size_t>(i) * sizeof(T);
+                    if (Write) data[index + byte] = array_bytes[index + sizeof(T) - 1 - byte];
+                    else array_bytes[index + sizeof(T) - 1 - byte] = data[index + byte];
+                }
+        }
+        return;
+    }
     auto array = primitive_array<T>(object);
     if (!count) return;
     auto elements = array->elements.get() + offset;
@@ -334,6 +354,25 @@ Object* buffer_bulk(Object* object, Object* bytes, std::int32_t offset, std::int
     }
     return buffer;
 }
+namespace {
+template<class T> void copy_reversed(const std::uint8_t* source, std::uint8_t* target,
+        std::int32_t count, bool backward) {
+    auto copy = [source, target](std::int32_t index) {
+        const auto offset = static_cast<std::size_t>(index) * sizeof(T);
+        T value;
+        // Read the complete element before writing: views can overlap at any
+        // byte offset, and neither view is necessarily naturally aligned.
+        std::memcpy(&value, source + offset, sizeof(T));
+        value = buffer_detail::reverse_bytes(value);
+        std::memcpy(target + offset, &value, sizeof(T));
+    };
+    if (backward) {
+        for (std::int32_t i = count; i > 0; --i) copy(i - 1);
+    } else {
+        for (std::int32_t i = 0; i < count; ++i) copy(i);
+    }
+}
+}
 Object* buffer_copy(Object* target, Object* source) {
     auto to = as_byte_buffer(target), from = as_byte_buffer(source);
     if (to == from) raise("java/lang/IllegalArgumentException", "Source buffer is destination");
@@ -342,12 +381,29 @@ Object* buffer_copy(Object* target, Object* source) {
     int count = from->limit.get() - source_position;
     if (count < 0) raise("java/nio/BufferUnderflowException");
     if (count > to->limit.get() - target_position) raise("java/nio/BufferOverflowException");
-    if (from->element == 'B' && to->element == 'B'
+    if (from->element == to->element
             && !from->heap_array.get() && !to->heap_array.get()) {
-        // Views can overlap. Bulk copying avoids per-byte type/position checks
-        // and a temporary allocation while retaining ByteBuffer.put semantics.
-        if (count) std::memmove(to->storage->data() + to->offset + target_position,
-                from->storage->data() + from->offset + source_position, static_cast<std::size_t>(count));
+        // Typed views have element positions. Select the storage/order once,
+        // retaining overlap semantics without allocating an intermediate copy.
+        const auto width = static_cast<std::size_t>(from->element_size());
+        const auto source_offset = from->offset + static_cast<std::size_t>(source_position) * width;
+        const auto target_offset = to->offset + static_cast<std::size_t>(target_position) * width;
+        const auto bytes = static_cast<std::size_t>(count) * width;
+        if (count) {
+            auto input = from->storage->data() + source_offset;
+            auto output = to->storage->data() + target_offset;
+            if (width == 1 || from->little_endian.get() == to->little_endian.get())
+                std::memmove(output, input, bytes);
+            else {
+                const bool backward = from->storage == to->storage && target_offset > source_offset
+                        && target_offset - source_offset < bytes;
+                switch (width) {
+                    case 2: copy_reversed<std::uint16_t>(input, output, count, backward); break;
+                    case 4: copy_reversed<std::uint32_t>(input, output, count, backward); break;
+                    case 8: copy_reversed<std::uint64_t>(input, output, count, backward); break;
+                }
+            }
+        }
         from->position.set(source_position + count);
         to->position.set(target_position + count);
     } else {

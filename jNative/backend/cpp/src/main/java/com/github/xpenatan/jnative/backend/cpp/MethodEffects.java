@@ -12,6 +12,7 @@ import org.objectweb.asm.tree.*;
 
 import java.util.*;
 import java.util.function.Predicate;
+import java.util.function.BiPredicate;
 
 /**
  * Closed-world successful-path effects, including transitive work and actual lowering.
@@ -29,7 +30,10 @@ final class MethodEffects {
 
     private final Program program;
     private final Predicate<MethodInsnNode> runtimeLeaf;
+    private final Predicate<AbstractInsnNode> boundedTypeCheck;
     private final Predicate<MethodInsnNode> cooperativeRuntime;
+    private final BiPredicate<MethodId, AbstractInsnNode> boundedReferenceStore;
+    private final Predicate<String> emptyInitialization;
     private final Map<MethodId, Summary> summaries = new LinkedHashMap<>();
     private final Map<MethodId, Summary> returningSummaries = new LinkedHashMap<>();
     private final Map<MethodId, Set<AbstractInsnNode>> returnPaths = new HashMap<>();
@@ -56,9 +60,33 @@ final class MethodEffects {
 
     MethodEffects(Program program, Predicate<MethodInsnNode> runtimeLeaf,
                   Predicate<MethodInsnNode> cooperativeRuntime) {
+        this(program, runtimeLeaf, cooperativeRuntime, (method, instruction) -> false);
+    }
+
+    MethodEffects(Program program, Predicate<MethodInsnNode> runtimeLeaf,
+                  Predicate<MethodInsnNode> cooperativeRuntime,
+                  BiPredicate<MethodId, AbstractInsnNode> boundedReferenceStore) {
+        this(program, runtimeLeaf, cooperativeRuntime, boundedReferenceStore, ignored -> false);
+    }
+
+    MethodEffects(Program program, Predicate<MethodInsnNode> runtimeLeaf,
+                  Predicate<MethodInsnNode> cooperativeRuntime,
+                  BiPredicate<MethodId, AbstractInsnNode> boundedReferenceStore,
+                  Predicate<AbstractInsnNode> boundedTypeCheck) {
+        this(program, runtimeLeaf, cooperativeRuntime, boundedReferenceStore, boundedTypeCheck, ignored -> false);
+    }
+
+    MethodEffects(Program program, Predicate<MethodInsnNode> runtimeLeaf,
+                  Predicate<MethodInsnNode> cooperativeRuntime,
+                  BiPredicate<MethodId, AbstractInsnNode> boundedReferenceStore,
+                  Predicate<AbstractInsnNode> boundedTypeCheck,
+                  Predicate<String> emptyInitialization) {
         this.program = program;
         this.runtimeLeaf = runtimeLeaf;
         this.cooperativeRuntime = cooperativeRuntime;
+        this.boundedReferenceStore = boundedReferenceStore;
+        this.boundedTypeCheck = boundedTypeCheck;
+        this.emptyInitialization = emptyInitialization;
         analyze();
     }
 
@@ -97,6 +125,11 @@ final class MethodEffects {
         return targets.size() == 1 && argumentProtection.contains(targets.getFirst());
     }
 
+    /** A validated terminal wrapper transfers its arguments into an audited native driver. */
+    boolean protectsNativeTailArguments(MethodId id) {
+        return delegatedRoots.contains(id) && tailCalls.get(id).stream().allMatch(this::nativeTailEntry);
+    }
+
     /** This admits polling/guards only; it never establishes a noncollecting call. */
     int cooperativeCallWork(MethodId caller, MethodInsnNode call) {
         if(!directCall(call)) return 0;
@@ -105,7 +138,8 @@ final class MethodEffects {
         Summary summary = cooperativeSummaries.get(targets.getFirst());
         if(summary == null) return 0;
         Set<String> initialized = new HashSet<>(summary.initialized());
-        if(call.getOpcode() == INVOKESTATIC) initialized.add(targets.getFirst().owner());
+        if(call.getOpcode() == INVOKESTATIC && !emptyInitialization.test(targets.getFirst().owner()))
+            initialized.add(targets.getFirst().owner());
         if((program.methods().get(caller).bytecode().access & ACC_STATIC) != 0)
             initialized.remove(caller.owner());
         return initialized.isEmpty() ? summary.work() : 0;
@@ -180,7 +214,8 @@ final class MethodEffects {
         boolean changed = false;
         for(List<MethodId> targets : tailCalls.values())
             for(MethodId target : targets)
-                if(!protection.getOrDefault(target, TerminalArgumentProtection.NONE).protects())
+                if(!nativeTailEntry(target)
+                        && !protection.getOrDefault(target, TerminalArgumentProtection.NONE).protects())
                     changed |= unprotectedTailEntries.add(target);
         if(changed) analyzeTailCalls();
         return changed;
@@ -189,7 +224,8 @@ final class MethodEffects {
     boolean tailArgumentsProtected(Map<MethodId, TerminalArgumentProtection> protection) {
         for(MethodId caller : delegatedRoots)
             for(MethodId target : tailCalls.get(caller))
-                if(!protection.getOrDefault(target, TerminalArgumentProtection.NONE).protects()) return false;
+                if(!nativeTailEntry(target)
+                        && !protection.getOrDefault(target, TerminalArgumentProtection.NONE).protects()) return false;
         return true;
     }
 
@@ -371,17 +407,18 @@ final class MethodEffects {
                             field.owner, field.name, field.desc)) continue;
                     String owner = fieldOwner((FieldInsnNode)instruction);
                     if(owner == null) return unknown("runtime static field");
-                    initialized.add(owner);
+                    if(!emptyInitialization.test(owner)) initialized.add(owner);
                 }
                 if(opcode == JSR
                         || opcode == RET
-                        || opcode == AASTORE
+                        || opcode == AASTORE && !boundedReferenceStore.test(method.id(), instruction)
                         || (opcode > RETURN
                         && opcode != GETFIELD
                         && opcode != PUTFIELD
                         && opcode != ARRAYLENGTH
                         && opcode != IFNULL
                         && opcode != IFNONNULL
+                        && !boundedTypeCheck.test(instruction)
                         && !staticField))
                     return unknown("operation may collect: " + opcode);
                 // Generated string slots are populated before any Java entry.
@@ -459,7 +496,7 @@ final class MethodEffects {
             for(MethodId target : targets) {
                 Program.Method callee = program.methods().get(target);
                 entryPoll &=
-                        callee != null
+                        nativeTailEntry(target) || callee != null
                                 && callee.nativeSymbol() == null
                                 && (callee.bytecode().access & (ACC_NATIVE | ACC_ABSTRACT)) == 0
                                 && !fallback.contains(target)
@@ -480,6 +517,16 @@ final class MethodEffects {
                         delegationInitializers.put(caller, prefixInitializers.get(caller));
                     }
                 });
+    }
+
+    /** Audited drivers publish all live references and cooperate on unbounded work.
+     * Nontrivial initialization is protected by the managed import adapter itself. */
+    private boolean nativeTailEntry(MethodId id) {
+        Program.Method method = program.methods().get(id);
+        if(method == null || method.nativeBinding() == null
+                || (method.bytecode().access & (ACC_STATIC | ACC_SYNCHRONIZED)) != ACC_STATIC) return false;
+        var binding = method.nativeBinding();
+        return binding.managed() && binding.runtimeOnly() && binding.managesRoots();
     }
 
     private List<MethodId> generatedCallTargets(MethodInsnNode call) {
@@ -530,15 +577,6 @@ final class MethodEffects {
         return initialized.isEmpty() ? work : 0;
     }
 
-    boolean boundedDispatch(MethodId call) {
-        // Runtime-owned implementations are not enumerated by instantiatedClasses.
-        // Their adapter contracts are checked separately by the runtime lowering.
-        Set<String> initialized = new HashSet<>();
-        return !program.platform(call.owner())
-                && dispatchWork(call, true, initialized) > 0
-                && initialized.isEmpty();
-    }
-
     private int callWork(
             MethodId caller, MethodInsnNode call, boolean returning, Set<String> initialized) {
         if(runtimeLeaf.test(call)) return 1;
@@ -548,7 +586,7 @@ final class MethodEffects {
                 MethodResolver.resolve(call.owner, call.name, call.desc, program.classes()::get, program::platform, program.bindings());
         if(declaration == null || !program.methods().containsKey(declaration)) return 0;
         if(call.getOpcode() == INVOKESTATIC) {
-            initialized.add(declaration.owner());
+            if(!emptyInitialization.test(declaration.owner())) initialized.add(declaration.owner());
             return work(declaration, returning, initialized);
         }
         if(call.getOpcode() == INVOKESPECIAL

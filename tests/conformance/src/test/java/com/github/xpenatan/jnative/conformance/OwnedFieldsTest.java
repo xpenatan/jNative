@@ -20,7 +20,7 @@ class OwnedFieldsTest {
 
     @ParameterizedTest
     @EnumSource(BuildType.class)
-    void primitiveStoragePreservesPublicationReflectionAndNativeExposure(BuildType buildType)
+    void ownedStoragePreservesTracingPublicationReflectionAndNativeExposure(BuildType buildType)
             throws Exception {
         Path source = temporary.resolve("FieldOwnership.java");
         Path classes = temporary.resolve("classes");
@@ -43,6 +43,8 @@ class OwnedFieldsTest {
                                 public volatile int published;
                                 public static int global;
                                 Object reference;
+                                Object[] array;
+                                volatile Object publishedReference;
                                 void update() {
                                     flag = !flag; small--; letter++; word--; count++;
                                     wide += 12345678901L; fraction -= .25f; precise += .125;
@@ -51,12 +53,16 @@ class OwnedFieldsTest {
                             static class Derived extends Values {
                                 int read() { return count; }
                             }
-                            static class SharedParent { int count; long wide; double precise; }
+                            static class SharedParent { int count; long wide; double precise; Object reference; }
                             static class SharedChild extends SharedParent {
                                 volatile boolean ready;
-                                void publish() { count = 31; wide = 987654321234L; precise = -0.0; ready = true; }
+                                void publish() {
+                                    count = 31; wide = 987654321234L; precise = -0.0;
+                                    reference = new String(new char[] {'w', 'o', 'r', 'k'});
+                                    ready = true;
+                                }
                             }
-                            public static class Reflected { public int count; }
+                            public static class Reflected { public int count; public String reference; }
                             static class NativePayload { int count; }
                             static class NativeEnvelope { final NativePayload payload = new NativePayload(); }
                             @NativeImport("inspect_field_envelope") static void inspect(NativeEnvelope value) {}
@@ -76,16 +82,29 @@ class OwnedFieldsTest {
                                 System.out.println(value.read()); System.out.println(value.wide);
                                 System.out.println(Float.floatToRawIntBits(value.fraction));
                                 System.out.println(Double.doubleToRawLongBits(value.precise));
-                                value.reference = new Object(); value.published = 9; Values.global = 17;
+                                value.reference = new String(new char[] {'k', 'e', 'e', 'p'});
+                                value.array = new Object[] {value.reference, new int[] {37}};
+                                value.publishedReference = value.reference;
+                                System.gc();
+                                System.out.println(value.reference);
+                                System.out.println(((int[])value.array[1])[0]);
+                                value.reference = null;
+                                System.gc();
+                                System.out.println(value.array[0] == value.publishedReference);
+                                value.published = 9; Values.global = 17;
                                 System.out.println(value.published + Values.global);
                                 SharedChild shared = new SharedChild();
                                 Thread worker = new Thread(() -> { shared.publish(); new Local().get(); System.gc(); });
                                 worker.start(); while (!shared.ready) Thread.yield();
                                 System.out.println(shared.count); System.out.println(shared.wide);
-                                System.out.println(Double.doubleToRawLongBits(shared.precise)); worker.join();
+                                System.out.println(Double.doubleToRawLongBits(shared.precise));
+                                System.gc(); System.out.println(shared.reference); worker.join();
                                 Reflected reflected = new Reflected();
                                 var field = Reflected.class.getField("count"); field.setInt(reflected, 73);
                                 System.out.println(reflected.count); System.out.println(field.getInt(reflected));
+                                var referenceField = Reflected.class.getField("reference");
+                                referenceField.set(reflected, new String(new char[] {'r', 'e', 'f'})); System.gc();
+                                System.out.println(referenceField.get(reflected) == reflected.reference);
                                 NativeEnvelope envelope = new NativeEnvelope(); inspect(envelope);
                                 System.out.println(envelope.payload.count); System.out.println(exported().count);
                                 System.out.println(new Local().get());
@@ -130,12 +149,14 @@ class OwnedFieldsTest {
                         "countI",
                         "wideJ",
                         "fractionF",
-                        "preciseD")) {
+                        "preciseD",
+                        "referenceLjava/lang/Object;",
+                        "array[Ljava/lang/Object;")) {
             assertTrue(report.contains("FieldOwnership$Values." + field + "\tplain"), report);
         }
         assertFalse(report.contains("Values.published"), report);
         assertFalse(report.contains("Values.global"), report);
-        assertFalse(report.contains("Values.reference"), report);
+        assertFalse(report.contains("Values.publishedReference"), report);
         for(String owner :
                 List.of(
                         "SharedParent",

@@ -3,26 +3,96 @@
 #include <algorithm>
 
 namespace jnative {
+inline Object* hashmap_first_node(ReferenceArray* table, std::int32_t hash) {
+    // HashMap's private table starts at capacity >= 1 and only doubles. The
+    // mask therefore proves the index is in range, including negative hashes.
+    const auto slot = static_cast<std::uint32_t>(hash)
+            & (static_cast<std::uint32_t>(table->length) - 1);
+    return table->elements[slot].get();
+}
+
+template<class Equals>
+JNATIVE_NOINLINE std::int32_t hashmap_lookup_equals(Object* receiver, Object* key,
+                                                   Object* node, Object* stored, Equals equals) {
+    RootFrame<4> roots;
+    roots.slot(0) = receiver;
+    roots.slot(1) = key;
+    roots.slot(2) = node;
+    roots.slot(3) = stored;
+    roots.heap().poll_if_requested();
+    return equals(key, stored);
+}
+
+template<class Equals, class Hash, class Key, class Value, class Next>
+JNATIVE_NOINLINE Object* hashmap_lookup_chain(Object* receiver, Object* key, Object* node,
+        std::int32_t code, std::int32_t return_value,
+        Equals equals, Hash hash, Key node_key, Value value, Next next) {
+    auto& heap = managed_heap();
+    while (node) {
+        if (heap.collection_pending()) poll_with_roots(heap, receiver, key, node);
+        if (hash.get(node) == code) {
+            Object* stored = node_key.get(node);
+            std::int32_t matches = key == stored;
+            if (!matches && key && !equals.try_invoke(&matches, key, stored))
+                matches = hashmap_lookup_equals(receiver, key, node, stored, equals);
+            if (matches) return return_value ? value.get(node) : node;
+        }
+        node = next.get(node);
+    }
+    return nullptr;
+}
+
+template<class Lookup, class HashCode, class Equals, class Buckets, class Hash,
+         class Key, class Value, class Next>
+JNATIVE_FORCEINLINE Object* hashmap_lookup(Object* receiver, Object* key, std::int32_t return_value,
+                      Lookup fallback, HashCode hash_code, Equals equals,
+                      Buckets buckets, Hash hash, Key node_key, Value value, Next next) {
+    // Subclasses may override the protected hash/equality hooks. Their Java
+    // driver remains authoritative; exact base maps can use Object callbacks.
+    // The protected callback owns argument publication. No references survive
+    // this terminal fallback, so another driver root frame would be redundant.
+    if (!buckets.exact_owner(receiver)) return fallback(receiver, key, return_value);
+    std::int32_t code = 0;
+    if (key && !hash_code.try_invoke(&code, key)) return fallback(receiver, key, return_value);
+    code ^= unsigned_shift(code, 16);
+    auto* table = reference_array(buckets.get(receiver));
+    Object* node = hashmap_first_node(table, code);
+    if (!node) return nullptr;
+    // Keep first-bucket work bounded and inline. Traversal state and cooperative
+    // slow calls then do not enlarge the common path's register/stack footprint.
+    if (hash.get(node) == code) {
+        Object* stored = node_key.get(node);
+        if (key == stored) return return_value ? value.get(node) : node;
+        if (key) {
+            std::int32_t matches;
+            if (!equals.try_invoke(&matches, key, stored))
+                return hashmap_lookup_chain(receiver, key, node, code, return_value,
+                                            equals, hash, node_key, value, next);
+            if (matches) return return_value ? value.get(node) : node;
+        }
+    }
+    node = next.get(node);
+    return node ? hashmap_lookup_chain(receiver, key, node, code, return_value,
+                                      equals, hash, node_key, value, next) : nullptr;
+}
+
 inline std::int32_t hashmap_capacity(std::int32_t capacity) {
     std::int32_t size = 1;
     while (size < capacity && size < (1 << 30)) size <<= 1;
     return size;
 }
 
-template<class Buckets, class Head, class Tail, class Count, class Changes, class Load,
+template<class Buckets, class Head, class Tail, class Count, class Changes, class Load, class Threshold,
         class Hash, class Key, class Value, class Next, class Before, class After>
 struct HashMapState {
-    Buckets buckets; Head head; Tail tail; Count count; Changes changes; Load load;
+    Buckets buckets; Head head; Tail tail; Count count; Changes changes; Load load; Threshold threshold;
     Hash hash; Key key; Value value; Next next; Before before; After after;
 };
 
-template<class State, class Hash, class Equals>
-Object* hashmap_locate(Object* receiver, Object* key, State fields, Hash hash, Equals equals) {
-    RootFrame<3> roots;
-    FrameRoot<> map(roots.slot(0), receiver);
-    FrameRoot<> wanted(roots.slot(1), key);
-    FrameRoot<> node(roots.slot(2));
-    std::int32_t code = hash(map.get(), wanted.get());
+template<class State, class Equals>
+Object* hashmap_locate(FrameRoot<>& map, FrameRoot<>& wanted, FrameRoot<>& node,
+                       std::int32_t code, State fields, Equals equals) {
+    // Reuse the caller's published slots through callbacks and collision-chain polls.
     Object* buckets = fields.buckets.get(map.get());
     node.set(reference_get(buckets, code & (array_length(buckets) - 1)));
     std::uint32_t work = 0;
@@ -35,11 +105,6 @@ Object* hashmap_locate(Object* receiver, Object* key, State fields, Hash hash, E
     return nullptr;
 }
 
-template<class Hash, class Equals, class... Fields>
-Object* hashmap_find(Object* receiver, Object* key, Hash hash, Equals equals, Fields... fields) {
-    return hashmap_locate(receiver, key, HashMapState<Fields...>{fields...}, hash, equals);
-}
-
 template<class State, class MakeBuckets>
 void hashmap_grow(Object* receiver, State fields, MakeBuckets make_buckets) {
     RootFrame<5> roots;
@@ -48,63 +113,111 @@ void hashmap_grow(Object* receiver, State fields, MakeBuckets make_buckets) {
     FrameRoot<> grown(roots.slot(2));
     FrameRoot<> node(roots.slot(3));
     FrameRoot<> next(roots.slot(4));
-    std::int32_t size = array_length(source.get());
+    auto* source_array = reference_array(source.get());
+    const std::int32_t size = source_array->length;
     if (size >= (1 << 30)) return;
     grown.set(make_buckets(size << 1));
-    std::int32_t mask = array_length(grown.get()) - 1;
+    auto* grown_array = reference_array(grown.get());
+    const std::int32_t mask = grown_array->length - 1;
+    const bool compatible = grown_array->accepts_any_reference
+            || (source_array->component_class_id != 0
+                && source_array->component_class_id == grown_array->component_class_id);
+    // Managed addresses and array metadata are stable across a collection.
+    // Both arrays stay rooted; equal component IDs prove every transferred
+    // reference is store-compatible without checking each node's type again.
     std::uint32_t work = 0;
     for (std::int32_t i = 0; i < size; ++i) {
-        node.set(reference_get(source.get(), i));
+        node.set(source_array->elements[static_cast<std::uint32_t>(i)].get());
         while (node.get()) {
             next.set(fields.next.get(node.get()));
             std::int32_t slot = fields.hash.get(node.get()) & mask;
-            fields.next.set(node.get(), reference_get(grown.get(), slot));
-            reference_set(grown.get(), slot, node.get());
+            grown_array->bounds(slot);
+            auto& entry = grown_array->elements[static_cast<std::uint32_t>(slot)];
+            fields.next.set(node.get(), entry.get());
+            if (compatible) entry.set(node.get());
+            else reference_set(grown.get(), slot, node.get());
             node.set(next.get());
             if ((++work & 1023) == 0) safepoint();
         }
         if ((++work & 1023) == 0) safepoint();
     }
     fields.buckets.set(map.get(), grown.get());
+    fields.threshold.set(map.get(), static_cast<float>(grown_array->length) * fields.load.get(map.get()));
 }
 
-template<class Hash, class Equals, class MakeNode, class MakeBuckets, class... Fields>
-Object* hashmap_put(Object* receiver, Object* key, Object* value, Hash hash, Equals equals,
-        MakeNode make_node, MakeBuckets make_buckets, Fields... accessors) {
-    auto fields = HashMapState<Fields...>{accessors...};
-    RootFrame<7> roots;
+template<class State, class MakeNode, class MakeBuckets>
+Object* hashmap_insert(Object* receiver, Object* key, Object* value, std::int32_t code,
+                      State fields, MakeNode make_node, MakeBuckets make_buckets) {
+    RootFrame<2> roots;
+    FrameRoot<> map(roots.slot(0), receiver);
+    FrameRoot<> buckets(roots.slot(1), fields.buckets.get(receiver));
+    auto* table = reference_array(buckets.get());
+    const auto slot = code & (table->length - 1);
+    table->bounds(slot);
+    // The callback protects its arguments through allocation. Only the map and
+    // table survive that call; the returned node is published before any poll.
+    Object* node = make_node(code, key, value, table->elements[slot].get());
+    reference_set(buckets.get(), slot, node);
+    Object* previous = fields.tail.get(map.get());
+    fields.before.set(node, previous);
+    if (!previous) fields.head.set(map.get(), node);
+    else fields.after.set(previous, node);
+    fields.tail.set(map.get(), node);
+    fields.count.set(map.get(), add(fields.count.get(map.get()), 1));
+    fields.changes.set(map.get(), add(fields.changes.get(map.get()), 1));
+    if (static_cast<float>(fields.count.get(map.get())) > fields.threshold.get(map.get()))
+        hashmap_grow(map.get(), fields, make_buckets);
+    return nullptr;
+}
+
+template<class State, class Hash, class Equals, class MakeNode, class MakeBuckets>
+JNATIVE_NOINLINE Object* hashmap_put_slow(Object* receiver, Object* key, Object* value,
+        std::int32_t code, bool hashed, State fields, Hash hash, Equals equals,
+        MakeNode make_node, MakeBuckets make_buckets) {
+    RootFrame<4> roots;
     FrameRoot<> map(roots.slot(0), receiver);
     FrameRoot<> wanted(roots.slot(1), key);
     FrameRoot<> replacement(roots.slot(2), value);
     FrameRoot<> node(roots.slot(3));
-    FrameRoot<> previous(roots.slot(4));
-    FrameRoot<> buckets(roots.slot(5));
-    FrameRoot<> old(roots.slot(6));
-    node.set(hashmap_locate(map.get(), wanted.get(), fields, hash, equals));
+    // Never repeat a hash callback already executed by the bounded path.
+    if (!hashed) code = hash(map.get(), wanted.get());
+    node.set(hashmap_locate(map, wanted, node, code, fields, equals));
     if (node.get()) {
-        old.set(fields.value.get(node.get()));
+        Object* old = fields.value.get(node.get());
         fields.value.set(node.get(), replacement.get());
-        return old.get();
+        return old;
     }
-    std::int32_t code = hash(map.get(), wanted.get());
-    buckets.set(fields.buckets.get(map.get()));
-    std::int32_t slot = code & (array_length(buckets.get()) - 1);
-    previous.set(reference_get(buckets.get(), slot));
-    node.set(make_node(code, wanted.get(), replacement.get(), previous.get()));
-    reference_set(buckets.get(), slot, node.get());
-    // The source facade rereads the current table after allocation.
-    node.set(reference_get(fields.buckets.get(map.get()), slot));
-    previous.set(fields.tail.get(map.get()));
-    fields.before.set(node.get(), previous.get());
-    if (!previous.get()) fields.head.set(map.get(), node.get());
-    else fields.after.set(previous.get(), node.get());
-    fields.tail.set(map.get(), node.get());
-    fields.count.set(map.get(), add(fields.count.get(map.get()), 1));
-    fields.changes.set(map.get(), add(fields.changes.get(map.get()), 1));
-    if (static_cast<float>(fields.count.get(map.get()))
-            > static_cast<float>(array_length(fields.buckets.get(map.get()))) * fields.load.get(map.get()))
-        hashmap_grow(map.get(), fields, make_buckets);
-    return nullptr;
+    return hashmap_insert(map.get(), wanted.get(), replacement.get(), code, fields, make_node, make_buckets);
+}
+
+template<class Hash, class Equals, class MakeNode, class MakeBuckets, class HashCode,
+         class ObjectEquals, class... Fields>
+Object* hashmap_put(Object* receiver, Object* key, Object* value, Hash hash, Equals equals,
+        MakeNode make_node, MakeBuckets make_buckets, HashCode hash_code,
+        ObjectEquals object_equals, Fields... accessors) {
+    auto fields = HashMapState<Fields...>{accessors...};
+    std::int32_t code = 0;
+    if (!fields.buckets.exact_owner(receiver) || (key && !hash_code.try_invoke(&code, key)))
+        return hashmap_put_slow(receiver, key, value, 0, false, fields, hash, equals, make_node, make_buckets);
+    code ^= unsigned_shift(code, 16);
+    auto* table = reference_array(fields.buckets.get(receiver));
+    Object* node = hashmap_first_node(table, code);
+    // Check chains before invoking equality, so the slow traversal never repeats
+    // an observable callback. It owns roots and polling for unbounded work.
+    if (node && fields.next.get(node))
+        return hashmap_put_slow(receiver, key, value, code, true, fields, hash, equals, make_node, make_buckets);
+    if (node && fields.hash.get(node) == code) {
+        Object* stored = fields.key.get(node);
+        std::int32_t matches = key == stored;
+        if (!matches && key && !object_equals.try_invoke(&matches, key, stored))
+            return hashmap_put_slow(receiver, key, value, code, true, fields, hash, equals, make_node, make_buckets);
+        if (matches) {
+            Object* old = fields.value.get(node);
+            fields.value.set(node, value);
+            return old;
+        }
+    }
+    return hashmap_insert(receiver, key, value, code, fields, make_node, make_buckets);
 }
 
 template<class Hash, class Equals, class... Fields>

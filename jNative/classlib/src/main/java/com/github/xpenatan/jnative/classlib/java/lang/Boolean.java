@@ -37,7 +37,7 @@ public final class Boolean implements Comparable<Boolean>, Serializable {
     }
 
     public int hashCode() {
-        return hashCode(value);
+        return value ? 1231 : 1237;
     }
 
     public static int hashCode(boolean value) {

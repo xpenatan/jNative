@@ -63,7 +63,9 @@ package in the filename. Both are covered by conformance tests.
 
 Linux builds use the same native project with CMake. Linux reports contain a
 minimal signal/PC record; use the system's configured core collection for complete
-thread unwinding. Decode a collected core with --core <file> and Linux GDB.
+thread unwinding. Automated Linux core-file decoding is unavailable; inspect a
+collected core manually with GDB and the exact archived image. The `decode`
+command still supports the captured signal/PC report.
 No core configuration is changed by this sample.
 
 The example intentionally uses console pause on normal exit, including Release.

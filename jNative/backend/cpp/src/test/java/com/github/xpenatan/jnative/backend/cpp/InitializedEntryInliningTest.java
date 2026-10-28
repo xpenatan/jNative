@@ -23,7 +23,7 @@ class InitializedEntryInliningTest {
         Path source = directory.resolve("InlineEntries.java");
         Files.writeString(source, """
                 public class InlineEntries {
-                    static int value;
+                    static int value = 1;
                     static class Foreign {
                         static int call(int n) { return InlineEntries.arithmetic(n); }
                         static void direct(int[] a,int[] b) { System.arraycopy(a,0,b,0,7); }

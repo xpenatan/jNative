@@ -30,6 +30,7 @@ class OwnedArraysTest {
                         import com.github.xpenatan.jnative.interop.NativeInclude;
                         @NativeInclude("jnative_imports.h")
                         public class Ownership {
+                            static Object published;
                             static class Owned {
                                 private final float[] values;
                                 Owned(int size) { values = new float[size]; }
@@ -89,8 +90,10 @@ class OwnedArraysTest {
                                 try { new Owned(-1); } catch (NegativeArraySizeException expected) { System.out.println("negative"); }
                                 System.out.println(new Owned(0).size());
                                 Escaped escaped = new Escaped(); escaped.expose()[1] = -0.0f;
+                                published = escaped.expose();
                                 Derived internal = new Derived(); internal.fill(); System.out.println(internal.read());
                                 AliasChild inherited = new AliasChild(); inherited.expose()[0] = 123; System.out.println(inherited.values[0]);
+                                published = inherited.expose();
                                 System.out.println(Float.floatToRawIntBits(escaped.expose()[1]));
                                 System.out.println(new Aliased().run());
                                 Shared shared = new Shared(); shared.add();

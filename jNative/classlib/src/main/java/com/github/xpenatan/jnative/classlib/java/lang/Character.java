@@ -126,10 +126,11 @@ public final class Character implements Comparable<Character> {
         };
     }
 
-    private static final Character[] CACHE = new Character[128];
-
-    static {
-        for(int i = 0; i < CACHE.length; ++i) CACHE[i] = new Character((char)(i));
+    private static final class Cache {
+        static final Character[] VALUES = new Character[128];
+        static {
+            for(int i = 0; i < VALUES.length; ++i) VALUES[i] = new Character((char)i);
+        }
     }
 
     public Character(char value) {
@@ -137,7 +138,8 @@ public final class Character implements Comparable<Character> {
     }
 
     public static Character valueOf(char value) {
-        return value < 128 ? CACHE[value] : new Character(value);
+        if(value < 128) return Cache.VALUES[value];
+        return new Character(value);
     }
 
     public char charValue() {
@@ -149,7 +151,7 @@ public final class Character implements Comparable<Character> {
     }
 
     public int hashCode() {
-        return hashCode(value);
+        return value;
     }
 
     public static int hashCode(char value) {

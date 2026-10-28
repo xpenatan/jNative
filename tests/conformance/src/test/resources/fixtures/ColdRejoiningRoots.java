@@ -79,6 +79,17 @@ public class ColdRejoiningRoots {
         }
         return 0;
     }
+    static int nested(int[] kept, boolean enabled, boolean cold) {
+        if (enabled) {
+            int[] selected = kept;
+            if (cold) {
+                selected = new int[] {kept[0] + 3};
+                System.gc();
+            }
+            kept[0] += selected[0];
+        }
+        return kept[0];
+    }
     static int caught(int[] kept, boolean cold) {
         try { if (cold) { System.gc(); throw new IllegalStateException(); } }
         catch (IllegalStateException expected) { System.gc(); }
@@ -103,6 +114,7 @@ public class ColdRejoiningRoots {
                 total += choose(kept, mode)[0];
                 total += multiple(kept, mode < 0, mode == -1 || mode == 0);
                 total += recursive(kept, mode <= 0, 12);
+                total += nested(kept, mode < 1, mode < 0);
                 ColdRejoiningRoots owner = new ColdRejoiningRoots();
                 owner.field = new int[] { round + 11 };
                 total += consumedBeforeCollection(owner, mode <= 0);

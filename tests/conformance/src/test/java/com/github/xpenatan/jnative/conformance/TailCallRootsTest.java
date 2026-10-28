@@ -102,6 +102,7 @@ class TailCallRootsTest {
                                 static int initialize() { System.gc(); System.out.println("transitive second"); return 11; }
                             }
                             static class TransitiveReader {
+                                static int initializationMarker = 1;
                                 static int read() { return TransitiveFirst.value + TransitiveSecond.value; }
                             }
                             static Payload[] extractionSource;

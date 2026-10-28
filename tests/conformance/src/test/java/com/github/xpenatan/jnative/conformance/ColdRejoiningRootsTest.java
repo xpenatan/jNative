@@ -43,7 +43,7 @@ class ColdRejoiningRootsTest {
         String cpp = Files.readString(generated.request().generatedSourcesDirectory()
                 .resolve("classes/ColdRejoiningRoots.cpp"));
         for(String name : List.of("rejoin", "choose", "multiple", "failing", "recursive",
-                "consumedBeforeCollection")) {
+                "nested", "consumedBeforeCollection")) {
             String body = body(cpp, name);
             assertTrue(body.contains("RootAddressFrame<"), body);
             assertTrue(body.contains("RootValue<>"), body);
@@ -61,6 +61,9 @@ class ColdRejoiningRootsTest {
             assertTrue(body.contains("RootFrame<"), body);
             assertFalse(body.contains("RootAddressFrame<"), body);
         }
+        String nested = body(cpp, "nested");
+        nested = nested.substring(nested.indexOf("if (enabled"));
+        assertTrue(nested.indexOf("RootAddressFrame<") > nested.indexOf("if (cold"), nested);
         var compiled = builder.compile(generated);
         assertEquals(expected, ProcessHarness.run(temporary,
                 List.of(compiled.executable().toString()), Duration.ofSeconds(60),

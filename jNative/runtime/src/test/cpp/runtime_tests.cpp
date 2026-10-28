@@ -1,5 +1,6 @@
 #include "jn_runtime.hpp"
 #include "jn_arrays.hpp"
+#include "jn_array_algorithms.hpp"
 #include "jn_abi.h"
 #include "jn_abi.hpp"
 #include "jn_native_storage.hpp"
@@ -330,6 +331,37 @@ void multiple_mutators() {
     require(completed == 2, "Workers did not finish");
     heap.collect();
     require(heap.statistics().first == 0, "Thread detach retained roots");
+}
+void collection_failure_recovery() {
+    using namespace jnative;
+    auto& heap = Heap::instance();
+    heap.collect();
+    heap.collection_threshold(100000);
+    struct FailingTrace : Object {
+        Object* child = nullptr;
+        bool fail = false;
+        void trace(Tracer& tracer) override {
+            tracer.visit(child);
+            if (fail) throw std::bad_alloc();
+        }
+    };
+    {
+        LocalRoot<FailingTrace> root(allocate<FailingTrace>());
+        heap.collect(); // Put the parent in the old list, its next child in a queue.
+        root->child = allocate<Node>();
+        allocate<Node>();
+        root->fail = true;
+        bool caught = false;
+        try { heap.collect(); } catch (const std::bad_alloc&) { caught = true; }
+        require(caught && !root->marked && !root->child->marked && heap.statistics().first == 3,
+                "Failed collection lost ownership or left stale marks");
+        root->fail = false;
+        heap.collect();
+        require(heap.statistics().first == 2 && !root->marked && !root->child->marked,
+                "Collection could not recover after failed marking");
+    }
+    heap.collect();
+    require(heap.statistics().first == 0, "Recovered collection leaked survivors");
 }
 void allocation_queues() {
     auto& heap = jnative::Heap::instance();
@@ -700,7 +732,7 @@ template<class T> void contiguous_primitive_contracts(const char* descriptor) {
     using Storage = PrimitiveArray<T>;
     using Field = OrdinaryField<T>;
     struct CompactHeader : Array { std::unique_ptr<Field[]> elements; };
-    static_assert(sizeof(PrimitiveArrayElements<T>) == sizeof(Field*), "Elements wrapper must retain pointer layout");
+    static_assert(sizeof(ArrayElements<T>) == sizeof(Field*), "Elements wrapper must retain pointer layout");
     static_assert(sizeof(Storage) == sizeof(CompactHeader), "Primitive header must contain only base metadata and elements");
     static_assert(!std::is_copy_constructible<Storage>::value && !std::is_move_constructible<Storage>::value,
         "Primitive trailing storage must not be copied or moved");
@@ -752,6 +784,7 @@ template<class T> void contiguous_primitive_contracts(const char* descriptor) {
             payload[i].set(primitive_sample<T>(i));
         }
         PrimitiveArrayView<T> view(root.get());
+        require(view.length() == count, "Primitive view length changed");
         for (std::int32_t i = 0; i < count; ++i) {
             const T expected = primitive_sample<T>(i), checked = array_get<T>(root.get(), i), viewed = view.get(i);
             require(std::memcmp(&checked, &expected, sizeof(T)) == 0
@@ -912,6 +945,81 @@ template<> double bounded_copy_sample<double>(std::int32_t index) {
         UINT64_C(0x7ff0000000000007), UINT64_C(0xfff8000000000009), 1};
     return jnative::bits_double(jnative::signed64(bits[index % 6]));
 }
+template<class T, class Bits> void confined_floating_reads(const char* descriptor,
+        std::initializer_list<Bits> patterns) {
+    using namespace jnative;
+    static_assert(sizeof(T) == sizeof(Bits), "Floating payload width mismatch");
+    const auto length = static_cast<std::int32_t>(patterns.size());
+    LocalRoot<> source(new_confined_array<T>(descriptor, length));
+    auto elements = static_cast<ConfinedPrimitiveArray<T>*>(source.get())->elements.get();
+    std::int32_t index = 0;
+    for (Bits bits : patterns) std::memcpy(elements + index++, &bits, sizeof(T));
+    ConfinedArrayView<T> values(source.get());
+    Heap::instance().collect();
+    index = 0;
+    for (Bits expected : patterns) {
+        T checked = values.get(index);
+        T unchecked = values.get_unchecked(index);
+        Bits checked_bits, unchecked_bits;
+        std::memcpy(&checked_bits, &checked, sizeof(T));
+        std::memcpy(&unchecked_bits, &unchecked, sizeof(T));
+        require(checked_bits == expected && unchecked_bits == expected,
+                "Confined read changed floating payload bits after collection");
+        ++index;
+    }
+    expect_copy_exception("java/lang/ArrayIndexOutOfBoundsException", [&] { values.get(-1); });
+    expect_copy_exception("java/lang/ArrayIndexOutOfBoundsException", [&] { values.get(length); });
+    expect_copy_exception("java/lang/NullPointerException", [&] { ConfinedArrayView<T>(nullptr).get(0); });
+}
+
+void confined_floating_read_contracts() {
+    confined_floating_reads<float, std::uint32_t>("[F", {0, UINT32_C(0x80000000),
+            UINT32_C(0x7fc00007), UINT32_C(0x7f800007), UINT32_C(0xffc00009), 1,
+            UINT32_C(0x7f800000), UINT32_C(0xff800000), UINT32_C(0x3f800000)});
+    confined_floating_reads<double, std::uint64_t>("[D", {0, UINT64_C(0x8000000000000000),
+            UINT64_C(0x7ff8000000000007), UINT64_C(0x7ff0000000000007), UINT64_C(0xfff8000000000009), 1,
+            UINT64_C(0x7ff0000000000000), UINT64_C(0xfff0000000000000), UINT64_C(0x3ff0000000000000)});
+}
+
+template<class T> void mixed_bounded_copy_contracts(const char* descriptor) {
+    using namespace jnative;
+    const std::int32_t length = 80;
+    for (bool plain_source : {false, true}) {
+        for (bool plain_target : {false, true}) {
+            LocalRoot<> source(plain_source ? new_confined_array<T>(descriptor, length) : new_array(descriptor, length));
+            LocalRoot<> target(plain_target ? new_confined_array<T>(descriptor, length) : new_array(descriptor, length));
+            for (std::int32_t count : {0, 1, 20, 32, 64}) {
+                for (std::int32_t i = 0; i < length; ++i) {
+                    array_set<T>(source.get(), i, bounded_copy_sample<T>(i));
+                    array_set<T>(target.get(), i, bounded_copy_sample<T>(i + 1));
+                }
+                if (count == 20) bounded_primitive_array_copy<T, 20>(source.get(), 3, target.get(), 5);
+                else if (count == 32) bounded_primitive_array_copy_inline<T, 32>(source.get(), 3, target.get(), 5);
+                else bounded_primitive_array_copy<T>(source.get(), 3, target.get(), 5, count);
+                for (std::int32_t i = 0; i < length; ++i) {
+                    T expected = bounded_copy_sample<T>(i >= 5 && i < 5 + count ? i - 2 : i + 1);
+                    T actual = array_get<T>(target.get(), i);
+                    require(std::memcmp(&actual, &expected, sizeof(T)) == 0,
+                            "Mixed bounded copy changed bits or destination range");
+                }
+            }
+            expect_copy_exception("java/lang/ArrayIndexOutOfBoundsException", [&] {
+                bounded_primitive_array_copy<T>(source.get(), -1, target.get(), 0, 0);
+            });
+            expect_copy_exception("java/lang/ArrayIndexOutOfBoundsException", [&] {
+                bounded_primitive_array_copy<T, 20>(source.get(), 0, target.get(), length - 19);
+            });
+            // A wrong template must still use arraycopy's actual Java kind.
+            bounded_primitive_array_copy<std::uint8_t>(source.get(), 0, target.get(), 0, 20);
+            for (std::int32_t i = 0; i < 20; ++i) {
+                T actual = array_get<T>(target.get(), i), expected = bounded_copy_sample<T>(i);
+                require(std::memcmp(&actual, &expected, sizeof(T)) == 0,
+                        "Mixed bounded copy fallback changed payload bits");
+            }
+        }
+    }
+}
+
 template<class T, std::int32_t Count> void constant_primitive_copy_contracts(const char* descriptor) {
     using namespace jnative;
     const std::int32_t length = 40;
@@ -1170,6 +1278,51 @@ std::int32_t reference_string_hash(const std::u16string& text) {
     std::memcpy(&signed_result, &result, sizeof(result));
     return signed_result;
 }
+void array_view_lengths() {
+    using namespace jnative;
+    for (int size : {0, 3}) {
+        LocalRoot<> references(new_array("[Ljava/lang/Object;", size));
+        LocalRoot<> primitives(new_array("[I", size));
+        LocalRoot<> confined(new_confined_array<std::int32_t>("[I", size));
+        require(ReferenceArrayView(references.get()).length() == size, "Reference view length changed");
+        require(ConfinedArrayView<std::int32_t>(confined.get()).length() == size, "Confined view length changed");
+        // ARRAYLENGTH accepts any array, independently of an element view's kind.
+        require(PrimitiveArrayView<float>(primitives.get()).length() == size, "Mismatched view changed arraylength");
+    }
+    ReferenceArrayView references(nullptr);
+    PrimitiveArrayView<std::int32_t> primitives(nullptr);
+    ConfinedArrayView<std::int32_t> confined(nullptr);
+    for (int kind = 0; kind < 3; ++kind) {
+        bool failed = false;
+        try { (void)(kind == 0 ? references.length() : kind == 1 ? primitives.length() : confined.length()); }
+        catch (const Thrown& error) { failed = std::strcmp(error.object()->type_name(), "java/lang/NullPointerException") == 0; }
+        require(failed, "Null view length did not fail at access");
+    }
+}
+void bounded_hash_attempts() {
+    using namespace jnative;
+    LocalRoot<> object(allocate<Object>());
+    LocalRoot<String> text(allocate<String>(u"cached hash"));
+    LocalRoot<String> zero(allocate<String>(std::u16string(2049, u'\0')));
+    LocalRoot<String> empty(allocate<String>(u""));
+    std::int32_t result = 123;
+    require(!try_object_hash(&result, nullptr) && result == 123, "Null hash attempt changed state");
+    require(!try_object_hash(&result, text.get()) && result == 123 && text->cached_hash.get() == 0,
+            "Uncached hash attempt performed work");
+    require(try_object_hash(&result, object.get()) && result == identity_hash(object.get()), "Identity hash attempt differed");
+    const auto expected = string_hash(text.get());
+    require(try_object_hash(&result, text.get()) && result == expected, "Cached hash attempt differed");
+    require(!try_object_hash(&result, zero.get()) && result == expected, "Zero hash attempt scanned uncached input");
+    require(try_object_hash(&result, empty.get()) && result == 0, "Empty hash attempt differed");
+    const auto saved = runtime_substitutions();
+    auto patched = saved;
+    patched.string_hash = +[](Object*) -> std::int32_t { throw std::runtime_error("Attempt called Java substitution"); };
+    configure_runtime_substitutions(patched);
+    result = 123;
+    const bool declined = !try_object_hash(&result, text.get()) && result == 123;
+    configure_runtime_substitutions(saved);
+    require(declined, "Cached hash bypassed runtime substitution");
+}
 void long_string_contracts() {
     using namespace jnative;
     const std::size_t sizes[] = {1023, 1024, 1025, 2047, 2048, 2049, 4097};
@@ -1208,14 +1361,83 @@ void long_string_contracts() {
     require(string_hash(empty.get()) == 0 && !string_equals(zero.get(), empty.get()),
             "Embedded zero units were treated as an empty String");
 }
-void long_string_collection(bool hashing) {
+template<class T> void primitive_sort_contracts(const char* descriptor) {
+    using namespace jnative;
+    std::uint32_t state = 0x12345678;
+    for (std::int32_t size : {0, 1, 2, 3, 31, 32, 33, 255, 256, 257, 4097}) {
+        for (int shape = 0; shape < 5; ++shape) {
+            LocalRoot<> input(new_array(descriptor, size + 2));
+            std::vector<T> expected(static_cast<std::size_t>(size) + 2);
+            expected.front() = std::numeric_limits<T>::min();
+            expected.back() = std::numeric_limits<T>::max();
+            for (std::int32_t i = 1; i <= size; ++i) {
+                state = state * UINT32_C(1664525) + UINT32_C(1013904223);
+                expected[i] = shape == 0 ? static_cast<T>(i) : shape == 1 ? static_cast<T>(size - i)
+                    : shape == 2 ? static_cast<T>(state % 7) : shape == 3 ? static_cast<T>(signed32(state))
+                    : i % 2 ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max();
+            }
+            for (std::int32_t i = 0; i < size + 2; ++i) array_set<T>(input.get(), i, expected[i]);
+            std::sort(expected.begin() + 1, expected.end() - 1);
+            array_sort_primitive<T>(input.get(), 1, size + 1);
+            for (std::int32_t i = 0; i < size + 2; ++i)
+                require(array_get<T>(input.get(), i) == expected[i], "Primitive sort lost values or modified its range boundaries");
+        }
+    }
+}
+void string_search_contracts() {
+    using namespace jnative;
+    const std::u16string patterns[] = {u"", u"a", u"b", u"aaaaab", u"ababababac", std::u16string{char16_t(0xd800), char16_t(0xdfff)}, std::u16string(513, u'a') + u'b'};
+    const std::u16string texts[] = {u"", u"a", u"aaaaabaaaaab", u"ababababababac", std::u16string(8193, u'a') + u'b',
+        std::u16string(2049, u'a') + u'b' + std::u16string(8193, u'a') + u'b'};
+    for (const auto& units : texts) {
+        LocalRoot<String> text(allocate<String>(units));
+        for (const auto& pattern : patterns) {
+            LocalRoot<String> needle(allocate<String>(pattern));
+            for (std::int32_t start : {INT32_MIN, -1, 0, 1, 4, 511, 1024, 2048, 8192, INT32_MAX}) {
+                const auto position = units.find(pattern, static_cast<std::size_t>(std::max(0, start)));
+                const auto expected = pattern.empty() ? std::min(std::max(0, start), static_cast<std::int32_t>(units.size()))
+                    : position == std::u16string::npos ? -1 : static_cast<std::int32_t>(position);
+                require(string_index_of_text(text.get(), needle.get(), start) == expected,
+                    "Adaptive String search skipped the earliest UTF-16 match");
+            }
+        }
+    }
+    // Candidate filtering must retain the earliest match in every vector lane,
+    // including embedded NUL/surrogates, a matching final lane and scalar tails.
+    for (std::int32_t padding : {33, 63, 511, 512, 513, 1023, 1024}) {
+        for (std::int32_t lane = 0; lane < 8; ++lane) {
+            const std::u16string pattern{char16_t(0xdfff), char16_t(0), char16_t(0xd800)};
+            const std::u16string false_match{char16_t(0xdfff), u'x', char16_t(0xd800)};
+            const auto units = std::u16string(padding + lane, u'x') + false_match + pattern;
+            LocalRoot<String> text(allocate<String>(units)), needle(allocate<String>(pattern));
+            for (std::int32_t start = 0; start <= padding + lane + 4; ++start) {
+                const auto expected = start <= padding + lane + 3 ? padding + lane + 3 : -1;
+                require(string_index_of_text(text.get(), needle.get(), start) == expected,
+                    "String candidate filter skipped a lane or read beyond the last candidate");
+            }
+        }
+    }
+    // Exercise every hash tail, arbitrary UTF-16 units and overflow, not just ASCII.
+    std::uint32_t state = 0x12345678;
+    for (std::size_t size = 0; size < 1050; ++size) {
+        std::u16string units(size, 0);
+        for (auto& unit : units) {
+            state = state * UINT32_C(1664525) + UINT32_C(1013904223);
+            unit = static_cast<char16_t>(state >> 16);
+        }
+        LocalRoot<String> text(allocate<String>(units));
+        require(string_hash(text.get()) == reference_string_hash(units), "Blocked String hash changed a tail or overflow");
+    }
+}
+void long_string_collection(bool hashing, bool searching = false) {
     using namespace jnative;
     auto& heap = Heap::instance();
     // All-zero text deliberately hashes to zero, so every hash call scans and
     // cannot satisfy the progress assertion through the cached fast path.
-    const std::u16string units(262145, u'\0');
+    const std::u16string units = searching ? std::u16string(262144, u'a') + u'b' : std::u16string(262145, u'\0');
+    const auto second_units = searching ? std::u16string(8192, u'a') + u'b' : units;
     LocalRoot<String> first(allocate<String>(units)), second;
-    if (!hashing) second.set(allocate<String>(units));
+    if (!hashing) second.set(allocate<String>(second_units));
     auto* first_pointer = first.get();
     auto* second_pointer = second.get();
     auto* roots_before = current_thread()->roots;
@@ -1238,6 +1460,7 @@ void long_string_collection(bool hashing) {
     const auto deadline = platform::monotonic_nanos() + 30000000000LL;
     while (!done.load(std::memory_order_acquire) && platform::monotonic_nanos() < deadline) {
         const bool value = hashing ? string_hash(first_pointer) == 0
+                : searching ? string_index_of_text(first_pointer, second_pointer, 0) == 253952
                 : string_equals(first_pointer, second_pointer);
         correct = correct && value && current_thread()->roots == roots_before;
         ++calls;
@@ -1248,9 +1471,8 @@ void long_string_collection(bool hashing) {
     // Release a starved collector before reporting the failure, as in the
     // existing monitor progress test; joining a running managed thread can block GC.
     { NativeRegion waiting; collector.join(); }
-    require(progressed && calls > 0, hashing ? "Long String hash prevented collection"
-                                           : "Long String equality prevented collection");
-    require(correct && first->value == units && (!second.get() || second->value == units),
+    require(progressed && calls > 0, "Long String hash, equality or search prevented collection");
+    require(correct && first->value == units && (!second.get() || second->value == second_units),
             "Long String scan lost its own argument roots or leaked root slots");
 }
 int main() {
@@ -1271,13 +1493,27 @@ int main() {
         contiguous_array_contracts();
         array_descriptor_contracts();
         bounded_array_copy_contracts();
+        confined_floating_read_contracts();
+        mixed_bounded_copy_contracts<std::uint16_t>("[C");
+        mixed_bounded_copy_contracts<std::int16_t>("[S");
+        mixed_bounded_copy_contracts<std::int32_t>("[I");
+        mixed_bounded_copy_contracts<std::int64_t>("[J");
+        mixed_bounded_copy_contracts<float>("[F");
+        mixed_bounded_copy_contracts<double>("[D");
         array_kernel_contracts();
         text_codec_kernel_contracts();
         long_string_contracts();
+        bounded_hash_attempts();
+        array_view_lengths();
+        primitive_sort_contracts<std::int32_t>("[I");
+        primitive_sort_contracts<std::int64_t>("[J");
+        string_search_contracts();
         long_string_collection(false);
         long_string_collection(true);
+        long_string_collection(false, true);
         multiple_mutators();
         allocation_queues();
+        collection_failure_recovery();
         monitor_publication();
         exception_roots();
         borrowed_handles();

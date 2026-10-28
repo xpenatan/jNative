@@ -16,12 +16,15 @@ import org.objectweb.asm.tree.analysis.*;
 import java.util.*;
 
 /**
- * Closed-world entry-thread ownership for primitive fields and internal final arrays.
+ * Closed-world entry-thread ownership for instance fields and internal final arrays.
  */
 final class OwnedArrays {
     private final Program program;
+    private final ArrayBorrowing borrowing;
     private final Set<FieldId> candidates = new HashSet<>();
-    private final Set<FieldId> primitiveFields = new HashSet<>();
+    private final Set<FieldId> ownedFields = new HashSet<>();
+    private final Set<FieldId> ordinaryArrays = new HashSet<>();
+    private final Set<FieldId> unprovedAssignments = new HashSet<>();
     private final Set<Object> escaped = new HashSet<>();
     private final Map<Object, FieldId> owners = new HashMap<>();
     private final Map<MethodId, Map<AbstractInsnNode, Object>> uses = new LinkedHashMap<>();
@@ -29,9 +32,16 @@ final class OwnedArrays {
     private final Set<String> concurrentOwners = new HashSet<>();
     private final Map<MethodId, Set<AbstractInsnNode>> instructionCache = new HashMap<>();
     private final Map<FieldId, FieldId> declarations = new HashMap<>();
+    private final Map<MethodId, FieldId> getters = new HashMap<>();
+    private final Set<MethodId> callbackEntries = new HashSet<>();
 
     OwnedArrays(Program program) {
+        this(program, new ArrayBorrowing(program));
+    }
+
+    OwnedArrays(Program program, ArrayBorrowing borrowing) {
         this.program = program;
+        this.borrowing = borrowing;
         findConcurrentAccess();
         Set<String> exposed = new HashSet<>();
         Set<FieldId> nativeArrayFields = new HashSet<>();
@@ -96,9 +106,7 @@ final class OwnedArrays {
             for(FieldNode field : owner.fields) {
                 FieldId id = new FieldId(owner.name, field.name, field.desc);
                 if((field.access & (ACC_STATIC | ACC_VOLATILE)) == 0
-                        && field.desc.length() == 1
-                        && "ZBCSIFJD".contains(field.desc)
-                        && !program.reflection().fields().contains(id)) primitiveFields.add(id);
+                        && !program.reflection().fields().contains(id)) ownedFields.add(id);
                 if((field.access & (ACC_PUBLIC | ACC_FINAL | ACC_STATIC | ACC_VOLATILE))
                         == ACC_FINAL
                         && field.desc.length() == 2
@@ -108,23 +116,46 @@ final class OwnedArrays {
                         && !nativeArrayFields.contains(id)) candidates.add(id);
             }
         }
+        ArrayDeque<MethodId> callbackRoots = new ArrayDeque<>();
+        for(Program.Method method : program.methods().values())
+            if(method.nativeBinding() != null) enqueueCallbacks(callbackRoots, method.nativeBinding());
+        callbackEntries.addAll(callbackRoots);
+        for(Program.Method method : program.methods().values()) {
+            FieldId getter = getterField(method);
+            if(getter != null && candidates.contains(getter)) getters.put(method.id(), getter);
+        }
         for(Program.Method method : program.methods().values()) {
             if(method.nativeSymbol() != null || method.bytecode().instructions.size() == 0)
                 continue;
             boolean relevant = false;
-            for(AbstractInsnNode instruction : method.bytecode().instructions)
+            for(AbstractInsnNode instruction : method.bytecode().instructions) {
                 if(instruction instanceof FieldInsnNode field && candidates.contains(id(field)))
                     relevant = true;
+                else if(instruction instanceof MethodInsnNode) {
+                    FieldId returned = returnedField(instruction);
+                    if(returned != null) relevant = true;
+                    else for(MethodId target : borrowing.callTargets(instruction)) {
+                        FieldId field = getters.get(target);
+                        if(field != null) escaped.add(field);
+                    }
+                }
+            }
             if(!relevant) continue;
             Map<AbstractInsnNode, Object> methodUses = new IdentityHashMap<>();
             uses.put(method.id(), methodUses);
             try {
-                new Analyzer<>(new Flow(methodUses))
+                new Analyzer<>(new Flow(methodUses, method.id()))
                         .analyze(method.id().owner(), method.bytecode());
             } catch(AnalyzerException | RuntimeException failure) {
                 // No field accessed by an unproved body can use a different layout.
-                for(AbstractInsnNode instruction : method.bytecode().instructions)
-                    if(instruction instanceof FieldInsnNode field) escaped.add(id(field));
+                for(AbstractInsnNode instruction : method.bytecode().instructions) {
+                    if(instruction instanceof FieldInsnNode field) {
+                        escaped.add(id(field));
+                        unprovedAssignments.add(id(field));
+                    }
+                    FieldId returned = returnedField(instruction);
+                    if(returned != null) escaped.add(returned);
+                }
             }
         }
         for(var entry : owners.entrySet())
@@ -132,6 +163,41 @@ final class OwnedArrays {
         candidates.removeAll(escaped);
         // Final fields without a proved fresh assignment keep the ordinary representation.
         candidates.retainAll(new HashSet<>(owners.values()));
+        ordinaryArrays.addAll(owners.values());
+        ordinaryArrays.removeAll(candidates);
+        ordinaryArrays.removeAll(unprovedAssignments);
+    }
+
+    // A trivial getter creates an alias, not necessarily an escape. All reachable
+    // callers are analyzed below; reflection/native/worker exposure still excludes
+    // the field before this proof. More complex returned aliases stay conservative.
+    private FieldId getterField(Program.Method method) {
+        if(method.nativeSymbol() != null || callbackEntries.contains(method.id())
+                || (method.bytecode().access & (ACC_STATIC | ACC_NATIVE | ACC_ABSTRACT)) != 0)
+            return null;
+        List<AbstractInsnNode> code = new ArrayList<>();
+        for(AbstractInsnNode instruction : method.bytecode().instructions)
+            if(instruction.getOpcode() >= 0) code.add(instruction);
+        if(code.size() != 3 || !(code.get(0) instanceof VarInsnNode receiver)
+                || receiver.getOpcode() != ALOAD || receiver.var != 0
+                || !(code.get(1) instanceof FieldInsnNode field) || field.getOpcode() != GETFIELD
+                || code.get(2).getOpcode() != ARETURN) return null;
+        return id(field);
+    }
+
+    private FieldId returnedField(AbstractInsnNode instruction) {
+        if(!(instruction instanceof MethodInsnNode call)) return null;
+        Type type = Type.getReturnType(call.desc);
+        if(type.getSort() != Type.ARRAY || type.getDimensions() != 1
+                || "CSIFJD".indexOf(type.getElementType().getDescriptor()) < 0) return null;
+        Set<MethodId> targets = borrowing.callTargets(instruction);
+        FieldId result = null;
+        for(MethodId target : targets) {
+            FieldId field = getters.get(target);
+            if(field == null || result != null && !result.equals(field)) return null;
+            result = field;
+        }
+        return result;
     }
 
     private static void expose(Set<String> exposed, Type type) {
@@ -144,12 +210,16 @@ final class OwnedArrays {
     }
 
     boolean plainField(String owner, FieldNode field) {
-        return primitiveFields.contains(new FieldId(owner, field.name, field.desc));
+        return ownedFields.contains(new FieldId(owner, field.name, field.desc));
+    }
+
+    boolean ordinaryArray(FieldInsnNode field) {
+        return ordinaryArrays.contains(id(field));
     }
 
     String fieldReport() {
         StringBuilder result = new StringBuilder("java-field\tstorage\tproof\n");
-        primitiveFields.stream()
+        ownedFields.stream()
                 .sorted(Comparator.comparing(Object::toString))
                 .forEach(
                         field ->
@@ -158,7 +228,7 @@ final class OwnedArrays {
                                         .append(field.name())
                                         .append(field.descriptor())
                                         .append(
-                                                "\tplain\tinstance primitive; no worker access,"
+                                                "\tplain\tinstance field; no worker access,"
                                                         + " reflection or native exposure\n"));
         return result.toString();
     }
@@ -186,8 +256,8 @@ final class OwnedArrays {
                                         .append(field.descriptor())
                                         .append(
                                                 "\tplain\tinternal final fresh array; no escaping"
-                                                        + " alias, worker access, reflection or native"
-                                                        + " exposure\n"));
+                                                        + " alias, worker access, reflection or retaining"
+                                                        + " native exposure\n"));
         return result.toString();
     }
 
@@ -340,10 +410,12 @@ final class OwnedArrays {
 
     private final class Flow extends BasicInterpreter {
         private final Map<AbstractInsnNode, Object> methodUses;
+        private final MethodId method;
 
-        Flow(Map<AbstractInsnNode, Object> methodUses) {
+        Flow(Map<AbstractInsnNode, Object> methodUses, MethodId method) {
             super(ASM9);
             this.methodUses = methodUses;
+            this.method = method;
         }
 
         private void escape(BasicValue value) {
@@ -388,6 +460,8 @@ final class OwnedArrays {
             if(instruction.getOpcode() == ARRAYLENGTH
                     || instruction.getOpcode() == IFNULL
                     || instruction.getOpcode() == IFNONNULL) use(instruction, value);
+            else if(instruction.getOpcode() == ARETURN && value instanceof ArrayValue array
+                    && array.origin.equals(getters.get(method))) use(instruction, value);
             else escape(value);
             return result;
         }
@@ -409,7 +483,10 @@ final class OwnedArrays {
                         escaped.add(id(field));
                     }
                 }
-                else escaped.add(id(field));
+                else {
+                    escaped.add(id(field));
+                    unprovedAssignments.add(id(field));
+                }
             }
             else {
                 if(opcode >= IALOAD && opcode <= SALOAD && opcode != AALOAD && opcode != BALOAD)
@@ -437,14 +514,22 @@ final class OwnedArrays {
         public BasicValue naryOperation(
                 AbstractInsnNode instruction, List<? extends BasicValue> values)
                 throws AnalyzerException {
-            for(BasicValue value : values) escape(value);
-            return super.naryOperation(instruction, values);
+            for(int i = 0; i < values.size(); ++i)
+                if(values.get(i) instanceof ArrayValue && !borrowing.borrows(instruction, i)) escape(values.get(i));
+            BasicValue result = super.naryOperation(instruction, values);
+            FieldId field = returnedField(instruction);
+            if(field != null) {
+                ArrayValue alias = new ArrayValue(Type.getType(field.descriptor()), field);
+                use(instruction, alias);
+                return alias;
+            }
+            return result;
         }
 
         @Override
         public void returnOperation(
                 AbstractInsnNode instruction, BasicValue value, BasicValue expected) {
-            escape(value);
+            if(!(value instanceof ArrayValue array) || !array.origin.equals(getters.get(method))) escape(value);
         }
 
         @Override

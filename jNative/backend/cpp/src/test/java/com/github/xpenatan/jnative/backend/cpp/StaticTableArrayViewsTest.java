@@ -85,7 +85,7 @@ class StaticTableArrayViewsTest {
         String cpp = emit(fixture());
         for(String name : List.of("read", "affine")) {
             String body = body(cpp, name);
-            assertTrue(body.contains("const ::jnative::PrimitiveArrayView<std::int32_t> TABLE_elements"), body);
+            assertTrue(body.contains("const ::jnative::PrimitiveArrayView<std::int32_t, true> TABLE_elements"), body);
             assertTrue(body.indexOf("TABLE_elements(") < body.indexOf("while ("), body);
             assertTrue(body.contains("TABLE_elements.get("), body);
             assertTrue(body.contains("TABLE_elements.get_unchecked("), body);

@@ -10,6 +10,7 @@ bin/
 local.properties
 .DS_Store
 /.plan/
+/.performance/
 
 
 # Private release diagnostics; retain outside build output.

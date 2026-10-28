@@ -461,7 +461,7 @@ public final class NativeBuffers {
     @SubstituteMethod(owner = "java.nio.IntBuffer", name = "get", descriptor = "([I)Ljava/nio/IntBuffer;")
     @SubstituteMethod(owner = "java.nio.LongBuffer", name = "get", descriptor = "([J)Ljava/nio/LongBuffer;")
     @SubstituteMethod(owner = "java.nio.ShortBuffer", name = "get", descriptor = "([S)Ljava/nio/ShortBuffer;")
-    @NativeImport(value = "jnative::platform_ByteBuffer_get_63822f546f", managed = true, runtimeOnly = true, instance = true,
+    @NativeImport(value = "jnative::platform_ByteBuffer_get_63822f546f", managed = true, runtimeOnly = true, instance = true, borrowedArrays = {1},
             targets = {"java/nio/ByteBuffer.get([B)Ljava/nio/ByteBuffer;",
                     "java/nio/DoubleBuffer.get([D)Ljava/nio/DoubleBuffer;",
                     "java/nio/FloatBuffer.get([F)Ljava/nio/FloatBuffer;",
@@ -476,7 +476,7 @@ public final class NativeBuffers {
     @SubstituteMethod(owner = "java.nio.IntBuffer", name = "get", descriptor = "([III)Ljava/nio/IntBuffer;")
     @SubstituteMethod(owner = "java.nio.LongBuffer", name = "get", descriptor = "([JII)Ljava/nio/LongBuffer;")
     @SubstituteMethod(owner = "java.nio.ShortBuffer", name = "get", descriptor = "([SII)Ljava/nio/ShortBuffer;")
-    @NativeImport(value = "jnative::platform_ByteBuffer_get_cdc1ced698", managed = true, runtimeOnly = true, instance = true,
+    @NativeImport(value = "jnative::platform_ByteBuffer_get_cdc1ced698", managed = true, runtimeOnly = true, instance = true, borrowedArrays = {1},
             targets = {"java/nio/ByteBuffer.get([BII)Ljava/nio/ByteBuffer;",
                     "java/nio/DoubleBuffer.get([DII)Ljava/nio/DoubleBuffer;",
                     "java/nio/FloatBuffer.get([FII)Ljava/nio/FloatBuffer;",
@@ -596,7 +596,7 @@ public final class NativeBuffers {
     @SubstituteMethod(owner = "java.nio.IntBuffer", name = "put", descriptor = "([I)Ljava/nio/IntBuffer;")
     @SubstituteMethod(owner = "java.nio.LongBuffer", name = "put", descriptor = "([J)Ljava/nio/LongBuffer;")
     @SubstituteMethod(owner = "java.nio.ShortBuffer", name = "put", descriptor = "([S)Ljava/nio/ShortBuffer;")
-    @NativeImport(value = "jnative::platform_ByteBuffer_put_4a1975d465", managed = true, runtimeOnly = true, instance = true,
+    @NativeImport(value = "jnative::platform_ByteBuffer_put_4a1975d465", managed = true, runtimeOnly = true, instance = true, borrowedArrays = {1},
             targets = {"java/nio/ByteBuffer.put([B)Ljava/nio/ByteBuffer;",
                     "java/nio/DoubleBuffer.put([D)Ljava/nio/DoubleBuffer;",
                     "java/nio/FloatBuffer.put([F)Ljava/nio/FloatBuffer;",
@@ -611,7 +611,7 @@ public final class NativeBuffers {
     @SubstituteMethod(owner = "java.nio.IntBuffer", name = "put", descriptor = "([III)Ljava/nio/IntBuffer;")
     @SubstituteMethod(owner = "java.nio.LongBuffer", name = "put", descriptor = "([JII)Ljava/nio/LongBuffer;")
     @SubstituteMethod(owner = "java.nio.ShortBuffer", name = "put", descriptor = "([SII)Ljava/nio/ShortBuffer;")
-    @NativeImport(value = "jnative::platform_ByteBuffer_put_3d2788e8cb", managed = true, runtimeOnly = true, instance = true,
+    @NativeImport(value = "jnative::platform_ByteBuffer_put_3d2788e8cb", managed = true, runtimeOnly = true, instance = true, borrowedArrays = {1},
             targets = {"java/nio/ByteBuffer.put([BII)Ljava/nio/ByteBuffer;",
                     "java/nio/DoubleBuffer.put([DII)Ljava/nio/DoubleBuffer;",
                     "java/nio/FloatBuffer.put([FII)Ljava/nio/FloatBuffer;",

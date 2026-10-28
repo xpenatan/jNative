@@ -393,118 +393,12 @@ public final class NativeDiagnostics {
     }
 
     /**
-     * Decodes a Linux x64 ELF core using GDB with Python support, on the developer machine.
+     * Core-file unwinding is unavailable. Decode the captured crash report instead.
      */
     public static DecodedReport decodeCore(
             Path report, Path core, Path symbolStore, String debugger) {
-        Path work = null;
-        try {
-            var document = read(report.toAbsolutePath().normalize());
-            validateReport(document);
-            String id = Objects.toString(document.get("buildId"), "");
-            if(!id.matches("[0-9a-f]{32}"))
-                throw new CompilerException("JN4104 Invalid core build identity");
-            Path store = symbolStore.toAbsolutePath().normalize();
-            var bundle =
-                    openBundle(
-                            Files.isRegularFile(store.resolve("manifest.json"))
-                                    ? store
-                                    : store.resolve(id));
-            if(!bundle.buildId().equals(id))
-                throw new CompilerException("JN4104 Core build identity mismatch");
-            if(!"Linux".equals(read(bundle.manifest()).get("JN_SYSTEM")))
-                throw new CompilerException("JN4104 Linux archive required for core decoding");
-            work = Files.createTempDirectory(".jnative-stage-core-");
-            Path script = work.resolve("decode.py"),
-                    request = work.resolve("request.json"),
-                    result = work.resolve("result.json");
-            try(var input =
-                        NativeDiagnostics.class.getResourceAsStream("/cpp/jn_core_decode.py")) {
-                if(input == null)
-                    throw new CompilerException("JN4104 Missing core decoder resource");
-                Files.copy(input, script);
-            }
-            Files.writeString(
-                    request,
-                    Json.write(
-                            Map.of(
-                                    "archive",
-                                    linuxPath(bundle.directory()),
-                                    "core",
-                                    linuxPath(core),
-                                    "buildId",
-                                    id,
-                                    "output",
-                                    linuxPath(result))));
-            var command =
-                    new ArrayList<>(
-                            List.of(
-                                    debugger,
-                                    "-nx",
-                                    "-nh",
-                                    "-batch",
-                                    "-iex",
-                                    "set auto-load off",
-                                    "-iex",
-                                    "set debuginfod enabled off",
-                                    "-x",
-                                    linuxPath(script)));
-            if(windowsHost())
-                command.addAll(
-                        0,
-                        List.of(
-                                "wsl",
-                                "--exec",
-                                "env",
-                                "JNATIVE_CORE_REQUEST=" + linuxPath(request)));
-            run(
-                    command,
-                    bundle.directory(),
-                    Duration.ofSeconds(60),
-                    Map.of("JNATIVE_CORE_REQUEST", linuxPath(request)));
-            var output = read(result);
-            var sourceMap =
-                    Files.isRegularFile(bundle.directory().resolve("source-map.json"))
-                            ? read(bundle.directory().resolve("source-map.json"))
-                            : Map.<String, Object>of();
-            var sourceHashes = read(bundle.directory().resolve("source-hashes.json"));
-            StringBuilder text = new StringBuilder("Build: ").append(id).append("  Event: core\n");
-            for(Object item : Json.array(output.get("threads"))) {
-                var thread = Json.object(item);
-                text.append("Thread: ")
-                        .append(thread.get("thread"))
-                        .append(' ')
-                        .append(thread.get("threadName"))
-                        .append('\n');
-                int index = 0;
-                for(Object entry : Json.array(thread.get("decodedFrames"))) {
-                    var frame = Json.object(entry);
-                    annotateLocation(frame, sourceMap, sourceHashes);
-                    text.append('#')
-                            .append(index++)
-                            .append(' ')
-                            .append(frame.get("function"))
-                            .append(" at ")
-                            .append(
-                                    Objects.toString(
-                                            frame.get("location"),
-                                            Objects.toString(frame.get("pc"))))
-                            .append(
-                                    Boolean.TRUE.equals(frame.get("inline"))
-                                            ? " [inlined]\n"
-                                            : "\n");
-                }
-            }
-            return new DecodedReport(id, text.toString(), Json.write(output) + "\n");
-        } catch(IOException | IllegalArgumentException e) {
-            throw new CompilerException("JN4104 Cannot decode Linux core", e);
-        } finally {
-            if(work != null)
-                try {
-                    ProjectFiles.removeStaging(work);
-                } catch(IOException ignored) {
-                }
-        }
+        throw new CompilerException(
+                "JN4104 Linux core decoding is unavailable; decode the captured crash report instead");
     }
 
     /**

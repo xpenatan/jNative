@@ -8,10 +8,11 @@ import com.github.xpenatan.jnative.substitution.SubstituteClass;
 @SubstituteClass("java.lang.Byte")
 public final class Byte extends Number implements Comparable<Byte> {
     private final byte value;
-    private static final Byte[] CACHE = new Byte[256];
-
-    static {
-        for(int i = 0; i < CACHE.length; ++i) CACHE[i] = new Byte((byte)(i - 128));
+    private static final class Cache {
+        static final Byte[] VALUES = new Byte[256];
+        static {
+            for(int i = 0; i < VALUES.length; ++i) VALUES[i] = new Byte((byte)(i - 128));
+        }
     }
 
     public Byte(byte value) {
@@ -19,7 +20,7 @@ public final class Byte extends Number implements Comparable<Byte> {
     }
 
     public static Byte valueOf(byte value) {
-        return value >= -128 && value <= 127 ? CACHE[value + 128] : new Byte(value);
+        return Cache.VALUES[value + 128];
     }
 
     public byte byteValue() {
@@ -51,7 +52,7 @@ public final class Byte extends Number implements Comparable<Byte> {
     }
 
     public int hashCode() {
-        return hashCode(value);
+        return value;
     }
 
     public static int hashCode(byte value) {

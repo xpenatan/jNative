@@ -16,10 +16,27 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Executable inventory, including anonymous classes and javac's lambda bodies. */
 class ClasslibInventoryTest {
+    // Intentional managed algorithms remain visible to compiler ownership/effect
+    // analysis. Keep this exact list reviewed; new residual traversals still fail.
+    private static final Set<String> MANAGED_ALGORITHMS = Set.of(
+            "java/util/HashMap.lookup(Ljava/util/HashMap;Ljava/lang/Object;Z)Ljava/lang/Object;",
+            "java/util/IdentityHashMap.<init>(I)V",
+            "java/util/IdentityHashMap.find(Ljava/lang/Object;)I",
+            "java/util/IdentityHashMap.containsValue(Ljava/lang/Object;)Z",
+            "java/util/IdentityHashMap.get(Ljava/lang/Object;)Ljava/lang/Object;",
+            "java/util/IdentityHashMap.put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            "java/util/IdentityHashMap.rebuild(I)V",
+            "java/util/IdentityHashMap.equals(Ljava/lang/Object;)Z",
+            "java/util/IdentityHashMap.hashCode()I",
+            "com/github/xpenatan/jnative/classlib/java/util/IdentityHashMap$1.hashCode()I",
+            "com/github/xpenatan/jnative/classlib/java/util/IdentityHashMap$2.remove(Ljava/lang/Object;)Z",
+            "com/github/xpenatan/jnative/classlib/java/util/IdentityHashMap$Cursor.hasNext()Z");
     private static final Set<String> FIXED_CACHES = Set.of(
-            "java/lang/Byte.<clinit>()V", "java/lang/Short.<clinit>()V",
-            "java/lang/Character.<clinit>()V", "java/lang/Integer.<clinit>()V",
-            "java/lang/Long.<clinit>()V");
+            "com/github/xpenatan/jnative/classlib/java/lang/Byte$Cache.<clinit>()V",
+            "com/github/xpenatan/jnative/classlib/java/lang/Short$Cache.<clinit>()V",
+            "com/github/xpenatan/jnative/classlib/java/lang/Character$Cache.<clinit>()V",
+            "com/github/xpenatan/jnative/classlib/java/lang/Integer$Cache.<clinit>()V",
+            "com/github/xpenatan/jnative/classlib/java/lang/Long$Cache.<clinit>()V");
 
     @Test void inventoryRejectsUnboundNativesAndResidualJavaAlgorithms() throws Exception {
         Map<String, Set<String>> javaCalls = new TreeMap<>();
@@ -30,6 +47,7 @@ class ClasslibInventoryTest {
         List<String> classRows = new ArrayList<>();
         classRows.add("source\tclass\tmethodCount");
         Set<String> inventoriedClasses = new TreeSet<>();
+        Set<String> managedAlgorithms = new TreeSet<>();
         int bound = 0, nested = 0, synthetic = 0;
         Map<String, String> packaged = packagedClasses();
         for(String name : new TreeSet<>(ClassLibrary.classes())) {
@@ -78,6 +96,10 @@ class ClasslibInventoryTest {
                     for(var callback : binding.callbacks()) delegates.add(callback.method().toString());
                 } else if((method.access & Opcodes.ACC_ABSTRACT) != 0) {
                     classification = "interface-contract";
+                } else if(MANAGED_ALGORITHMS.contains(id)) {
+                    classification = "managed-java-algorithm";
+                    managedAlgorithms.add(id);
+                    javaCalls.put(id, delegates);
                 } else if(FIXED_CACHES.contains(id)) {
                     classification = "fixed-boxing-cache";
                 } else {
@@ -120,6 +142,7 @@ class ClasslibInventoryTest {
         assertFalse(repositorySources.isEmpty(), "The repository class-library source root must contain Java sources");
         assertEquals(repositorySources, sources, "Packaged source inventory must exactly match repository Java sources");
         assertEquals(packaged.keySet(), inventoriedClasses, "Every actual packaged class must have a class inventory row");
+        assertEquals(MANAGED_ALGORITHMS, managedAlgorithms, "Remove stale managed algorithm inventory entries");
         assertTrue(bound > 100, "Native declarations must be present in the packaged library");
         assertTrue(nested > 20, "Nested class inventory is missing");
         assertTrue(synthetic > 0, "Synthetic method inventory is missing");

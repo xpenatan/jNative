@@ -151,8 +151,10 @@ class ConfinedArraysTest {
         String local = method(code, "std::int32_t PrivateArrays::privateSum(");
         assertTrue(local.contains("new_confined_array<std::int32_t>"), local);
         assertTrue(local.contains("ConfinedArrayView<std::int32_t>"), local);
+        assertTrue(method(code, "std::int32_t PrivateArrays::called(")
+                .contains("new_confined_array<std::int32_t>"), code);
         for(String name :
-                List.of("phi", "reversePhi", "allocationsPhi", "nullable", "called", "captured"))
+                List.of("phi", "reversePhi", "allocationsPhi", "nullable", "captured"))
             assertFalse(
                     method(code, "std::int32_t PrivateArrays::" + name + "(")
                             .contains("new_confined_array"),

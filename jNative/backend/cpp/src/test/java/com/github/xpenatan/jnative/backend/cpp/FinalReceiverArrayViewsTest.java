@@ -129,7 +129,7 @@ class FinalReceiverArrayViewsTest {
 
     @Test void guardedViewsCrossBranchesAndKeepRowsChecked() throws Exception {
         String kernel = body(emit(fixture()), "kernel");
-        assertTrue(kernel.contains("PrimitiveArrayView<std::int32_t> input_elements"), kernel);
+        assertTrue(kernel.contains("PrimitiveArrayView<std::int32_t, true> input_elements"), kernel);
         assertTrue(kernel.contains("ReferenceArrayView rows_elements"), kernel);
         assertTrue(kernel.indexOf("input_elements(") < kernel.indexOf("while ("), kernel);
         assertTrue(kernel.contains("input_elements.get_unchecked("), kernel);

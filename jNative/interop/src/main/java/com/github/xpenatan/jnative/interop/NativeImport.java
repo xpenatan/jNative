@@ -44,6 +44,18 @@ public @interface NativeImport {
     boolean runtimeOnly() default false;
 
     /**
+     * Zero-based Java argument indexes borrowed only for this synchronous call.
+     * The implementation must not retain, return, publish, or asynchronously use
+     * these arrays or their storage. It must accept both ordinary and compiler-
+     * confined primitive arrays through representation-aware runtime accessors
+     * (for example PrimitiveArrayView&lt;T, true&gt;), never cast them to PrimitiveArray.
+     * Object parameters may be listed for APIs accepting several primitive kinds.
+     * This contract does not reduce allocation, exception, or safepoint effects.
+     * Requires managed mode without callbacks. Unknown imports stay conservative.
+     */
+    int[] borrowedArrays() default {};
+
+    /**
      * Managed implementation accesses generated fields and behavior only through emitted
      * reflection registrations, runtime representations and declared callbacks/field adapters.
      * Ownership analysis still exposes registered members and follows their dependencies.
@@ -63,6 +75,16 @@ public @interface NativeImport {
      * nonallocating or prevent the helper from being invoked on a worker thread.
      */
     boolean callbacksSynchronous() default false;
+
+    /**
+     * Pass virtual callbacks as callables supporting try_invoke(resultPointer, receiver, args...).
+     * A false result executes no Java work. A true result invokes only a compiler-proven bounded,
+     * noncollecting successful path; it may still throw. Ordinary callback invocations (including
+     * static callbacks) protect their arguments through the selected target or an adapter frame.
+     * The driver must protect references needed after a callback and all references live at its
+     * own polls. Requires runtimeOnly and callbacksSynchronous.
+     */
+    boolean boundedCallbacks() default false;
 
     /** Java argument containing each receiver; defaults to zero. -1 means a native rooted receiver. */
     int[] callbackReceivers() default {};
@@ -91,6 +113,16 @@ public @interface NativeImport {
      * initialization and dispatch may inline this access without its collecting import wrapper.
      */
     boolean boundedAccess() default false;
+
+    /**
+     * Optional managed C++ platform helper with signature bool(Return*, arguments...).
+     * Both outcomes are bounded and cannot allocate, poll, block, throw or call Java.
+     * A true result writes the ordinary helper's result; false leaves all state unchanged.
+     * The compiler may use it only after proving dispatch and trivial helper initialization.
+     * Requires runtimeOnly, a non-void platform target, and no callbacks, fields or monitor.
+     * The ordinary import retains its full effects and remains the fallback.
+     */
+    String boundedAttempt() default "";
 
     enum Invocation {
         VIRTUAL, INTERFACE, STATIC, SPECIAL

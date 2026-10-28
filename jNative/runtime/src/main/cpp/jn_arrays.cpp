@@ -20,6 +20,72 @@ bool ordinary_array_kind(char kind) {
     }
 }
 
+// Each load/store pair stays sequenced, including backwards copies: no snapshot
+// or atomic layout casting. Keep this kernel private to large runtime transfers.
+template<class T, class Input, class Output> void copy_primitive_elements(Input* input, Output* output,
+        std::int32_t count, bool backward) {
+    using Block = typename detail::MakePrimitiveArrayCopyIndices<8>::type;
+    if (backward) {
+        while (count >= 8) {
+            count -= 8;
+            detail::PrimitiveArrayCopyExpansion<T, 8>::backward(input + count, output + count, Block{});
+        }
+        while (count > 0) {
+            --count;
+            detail::copy_element(output[count], detail::copy_element(input[count]));
+        }
+    } else {
+        while (count >= 8) {
+            detail::PrimitiveArrayCopyExpansion<T, 8>::forward(input, output, Block{});
+            input += 8;
+            output += 8;
+            count -= 8;
+        }
+        for (std::int32_t i = 0; i < count; ++i) detail::copy_element(output[i], detail::copy_element(input[i]));
+    }
+}
+
+template<class T, class Input, class Output> void copy_primitive_chunk(Input* input, Output* output,
+        std::int32_t count, bool backward) {
+    copy_primitive_elements<T>(input, output, count, backward);
+}
+template<class T> void copy_primitive_chunk(T* input, T* output, std::int32_t count, bool) {
+    std::memmove(output, input, static_cast<std::size_t>(count) * sizeof(T));
+}
+
+// The caller validates the complete ranges and keeps both nonmoving arrays
+// rooted across polls. Select the representation once, outside the chunk loop.
+template<class T, class Input, class Output> void copy_primitive_chunks_storage(Input* input,
+        Output* output, std::int32_t count, bool backward) {
+    LoopSafepoint safepoint;
+    for (std::int32_t remaining = count; remaining > 0;) {
+        const auto size = std::min(chunk_size, remaining);
+        const auto offset = backward ? remaining - size : count - remaining;
+        copy_primitive_chunk<T>(input + offset, output + offset, size, backward);
+        remaining -= size;
+        if (remaining) safepoint.poll();
+    }
+}
+
+template<class T> void copy_primitive_chunks(Object* source, std::int32_t from,
+        Object* target, std::int32_t to, std::int32_t count, bool backward) {
+    if (borrowed_confined_array<T>(source)) {
+        auto input = static_cast<ConfinedPrimitiveArray<T>*>(source)->elements.get() + from;
+        if (borrowed_confined_array<T>(target))
+            copy_primitive_chunks_storage<T>(input,
+                    static_cast<ConfinedPrimitiveArray<T>*>(target)->elements.get() + to, count, backward);
+        else copy_primitive_chunks_storage<T>(input,
+                static_cast<PrimitiveArray<T>*>(target)->data() + to, count, backward);
+    } else {
+        auto input = static_cast<PrimitiveArray<T>*>(source)->data() + from;
+        if (borrowed_confined_array<T>(target))
+            copy_primitive_chunks_storage<T>(input,
+                    static_cast<ConfinedPrimitiveArray<T>*>(target)->elements.get() + to, count, backward);
+        else copy_primitive_chunks_storage<T>(input,
+                static_cast<PrimitiveArray<T>*>(target)->data() + to, count, backward);
+    }
+}
+
 void fill_range(Array* array, std::int32_t from, std::int32_t to) {
     if (from > to) raise("java/lang/IllegalArgumentException");
     if (from < 0 || to > array->length) raise("java/lang/ArrayIndexOutOfBoundsException");
@@ -114,8 +180,8 @@ void array_copy_cooperative(Object* source, std::int32_t from, Object* target, s
     }
     LocalRoot<> source_root(source);
     LocalRoot<> target_root(target);
-    const auto source_kind = require_non_null(source)->array_kind;
-    const auto target_kind = require_non_null(target)->array_kind;
+    const auto source_kind = java_array_kind(require_non_null(source)->array_kind);
+    const auto target_kind = java_array_kind(require_non_null(target)->array_kind);
     if (!source_kind || source_kind != target_kind) raise("java/lang/ArrayStoreException");
     if (!ordinary_array_kind(source_kind)) throw std::logic_error("Invalid array descriptor");
     auto input = static_cast<Array*>(source);
@@ -123,8 +189,18 @@ void array_copy_cooperative(Object* source, std::int32_t from, Object* target, s
     // Check the whole copy before writing, including chunks beyond the first.
     if (from < 0 || to < 0 || from > input->length - count || to > output->length - count)
         raise("java/lang/ArrayIndexOutOfBoundsException");
-    LoopSafepoint safepoint;
     const bool backward = source == target && to > from && to - from < count;
+    switch (source_kind) {
+        case 'Z': return copy_primitive_chunks<std::uint8_t>(source, from, target, to, count, backward);
+        case 'B': return copy_primitive_chunks<std::int8_t>(source, from, target, to, count, backward);
+        case 'C': return copy_primitive_chunks<std::uint16_t>(source, from, target, to, count, backward);
+        case 'S': return copy_primitive_chunks<std::int16_t>(source, from, target, to, count, backward);
+        case 'I': return copy_primitive_chunks<std::int32_t>(source, from, target, to, count, backward);
+        case 'J': return copy_primitive_chunks<std::int64_t>(source, from, target, to, count, backward);
+        case 'F': return copy_primitive_chunks<float>(source, from, target, to, count, backward);
+        case 'D': return copy_primitive_chunks<double>(source, from, target, to, count, backward);
+    }
+    LoopSafepoint safepoint;
     for (std::int32_t remaining = count; remaining > 0;) {
         const auto size = std::min(chunk_size, remaining);
         const auto offset = backward ? remaining - size : count - remaining;

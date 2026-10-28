@@ -8,10 +8,11 @@ import com.github.xpenatan.jnative.substitution.SubstituteClass;
 @SubstituteClass("java.lang.Short")
 public final class Short extends Number implements Comparable<Short> {
     private final short value;
-    private static final Short[] CACHE = new Short[256];
-
-    static {
-        for(int i = 0; i < CACHE.length; ++i) CACHE[i] = new Short((short)(i - 128));
+    private static final class Cache {
+        static final Short[] VALUES = new Short[256];
+        static {
+            for(int i = 0; i < VALUES.length; ++i) VALUES[i] = new Short((short)(i - 128));
+        }
     }
 
     public Short(short value) {
@@ -19,7 +20,8 @@ public final class Short extends Number implements Comparable<Short> {
     }
 
     public static Short valueOf(short value) {
-        return value >= -128 && value <= 127 ? CACHE[value + 128] : new Short(value);
+        if(value >= -128 && value <= 127) return Cache.VALUES[value + 128];
+        return new Short(value);
     }
 
     public byte byteValue() {
@@ -51,7 +53,7 @@ public final class Short extends Number implements Comparable<Short> {
     }
 
     public int hashCode() {
-        return hashCode(value);
+        return value;
     }
 
     public static int hashCode(short value) {

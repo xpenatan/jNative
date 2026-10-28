@@ -2,6 +2,7 @@
 #include "jn_diagnostics.hpp"
 #include "jn_common.hpp"
 #include "jn_platform.hpp"
+#include "jn_allocator.hpp"
 
 #include <atomic>
 #include <algorithm>
@@ -44,6 +45,7 @@ class Tracer {
 public:
     void visit(Object* object);
     void drain();
+    void clear() noexcept { work_.clear(); }
 };
 
 // A C++ shell is allocated before Java <init> runs. Trace only managed edges.
@@ -65,8 +67,10 @@ protected:
     void set_type_id(std::uint32_t value) { generated_type_id_ = value; }
 public:
     explicit Object(char array_kind = 0, RuntimeKind runtime_kind = RuntimeKind::object);
-    static void* operator new(std::size_t bytes) { return platform::allocate(bytes); }
-    static void operator delete(void* value) noexcept { platform::deallocate(value); }
+    static void* operator new(std::size_t bytes) { return managed_allocate(bytes); }
+    static void* operator new(std::size_t bytes, ManagedArena* arena) { return managed_allocate(bytes, arena); }
+    static void operator delete(void* value) noexcept { managed_deallocate(value); }
+    static void operator delete(void* value, ManagedArena*) noexcept { managed_deallocate(value); }
     virtual void trace(Tracer&) {}
     virtual const char* type_name() const { return "java/lang/Object"; }
     // Runtime-owned classes use zero. Reading immutable type metadata needs no
@@ -74,6 +78,13 @@ public:
     std::uint32_t type_id() const { return generated_type_id_; }
     virtual ~Object();
 };
+
+JNATIVE_FORCEINLINE void Tracer::visit(Object* object) {
+    if (object && !object->marked) {
+        object->marked = true;
+        work_.push_back(object);
+    }
+}
 
 template<class T> class ManagedField {
 protected:
@@ -99,9 +110,11 @@ public:
     void set(T value) { this->value_.store(value, std::memory_order_relaxed); }
 };
 
-// The closed program proves these instance primitives are accessed only from
+// The closed program proves these instance fields are accessed only from
 // the entry thread. Unknown native/reflection access and worker-reachable
 // fields keep OrdinaryField; volatile fields always keep ManagedField.
+// Reference slots still participate in tracing. The stop-the-world collector
+// reads them only after managed threads publish their roots and park.
 template<class T> class OwnedField {
     T value_{};
 public:
@@ -140,6 +153,8 @@ struct BorrowedBlock { BorrowedSlot slots[64]; };
 struct StackLocation { const char* method; const char* source; int line; };
 struct ThreadContext {
     Heap* heap = nullptr;
+    ManagedArena* arena = nullptr;
+    bool sweeping = false;
     RootSlot* roots = nullptr;
     RootFrameLink* root_frames = nullptr;
     RootAddressFrameLink* root_addresses = nullptr;
@@ -151,10 +166,16 @@ struct ThreadContext {
     std::unordered_map<std::uint64_t, Object*> thread_locals;
     std::vector<BorrowedSlot*> free_borrowed;
     std::vector<BorrowedBlock*> borrowed_blocks;
-    // Only this managed thread or the stopped-world collector touches the queue.
-    // The published count also permits statistics without reading its vector.
+    // Larger/nonlocal allocations need a pointer queue. Small pooled allocations
+    // are tracked in their arena slots. Published counters cover both representations.
     std::vector<Object*> allocation_queue;
     std::atomic<std::size_t> queued_allocations{0};
+    std::atomic<std::size_t> queued_bytes{0};
+    // Prefixes already merged into global pressure. The difference from the
+    // published counters is the current partial batch; no duplicate increments
+    // are needed for every allocation. Only this mutator or the collector writes.
+    std::size_t reported_allocations = 0;
+    std::size_t reported_bytes = 0;
     ThreadContext();
 };
 inline ThreadContext* current_thread() noexcept { return static_cast<ThreadContext*>(platform::managed_context()); }
@@ -174,6 +195,8 @@ class Heap {
     ::jnative::platform::Condition changed_;
     std::vector<ThreadContext*> threads_;
     std::vector<Object*> objects_;
+    std::vector<std::unique_ptr<ManagedArena>> arenas_;
+    Tracer tracer_;
     std::unordered_map<std::uint64_t, Object*> handles_;
     std::unordered_set<std::uint64_t> external_handles_;
     std::atomic<BorrowedBlock*> borrowed_directory_[4096]{};
@@ -183,11 +206,17 @@ class Heap {
     std::uint64_t next_handle_ = 1;
     std::size_t collections_ = 0;
     std::atomic<std::size_t> allocations_{0};
+    std::atomic<std::size_t> allocation_bytes_{0};
     std::size_t total_allocations_ = 0;
+    std::size_t total_allocated_bytes_ = 0;
+    std::size_t retained_bytes_ = 0;
+    std::size_t retained_objects_ = 0;
     std::size_t peak_objects_ = 0;
+    std::size_t peak_managed_bytes_ = 0;
     bool measure_ = false;
     std::vector<std::uint64_t> pauses_ns_;
     std::atomic<std::size_t> threshold_{4096};
+    std::atomic<std::size_t> byte_threshold_{4 * 1024 * 1024};
     bool adaptive_threshold_ = true;
     bool collecting_ = false;
     std::atomic<bool> collection_requested_{false};
@@ -196,6 +225,7 @@ class Heap {
     void park(std::unique_lock<::jnative::platform::Mutex>& lock);
     void flush_allocations(ThreadContext* thread);
     std::size_t object_count() const;
+    std::size_t managed_bytes() const;
 public:
     Heap();
     static Heap& instance();
@@ -204,6 +234,9 @@ public:
     void detach(ThreadContext* thread);
     bool try_close();
     void poll();
+    bool collection_pending() const {
+        return collection_requested_.load(std::memory_order_acquire);
+    }
     void poll_if_requested() {
         if (collection_requested_.load(std::memory_order_acquire)) poll();
     }
@@ -212,6 +245,50 @@ public:
     void leave_native();
     void adopt(Object* object);
     void before_allocation();
+    // Internal allocation path: the factory validated this attached context.
+    // Keep context checks and page/queue growth outside the common path.
+    JNATIVE_FORCEINLINE void before_allocation(ThreadContext* thread) {
+        poll_if_requested();
+        const auto reported = allocations_.load(std::memory_order_relaxed);
+        const auto threshold = threshold_.load(std::memory_order_relaxed);
+        const auto reported_bytes = allocation_bytes_.load(std::memory_order_relaxed);
+        const auto byte_threshold = byte_threshold_.load(std::memory_order_relaxed);
+        const auto pending = thread->queued_allocations.load(std::memory_order_relaxed) - thread->reported_allocations;
+        const auto pending_bytes = thread->queued_bytes.load(std::memory_order_relaxed) - thread->reported_bytes;
+        if (reported >= threshold || pending >= threshold - reported
+                || reported_bytes >= byte_threshold || pending_bytes >= byte_threshold - reported_bytes)
+            collect();
+    }
+    JNATIVE_FORCEINLINE void adopt(ThreadContext* thread, Object* object) {
+        auto bytes = ManagedArena::adopt(object, this);
+        if (!bytes) {
+            thread->allocation_queue.push_back(object);
+            bytes = managed_allocation_size(object);
+        }
+        account_allocation(thread, bytes);
+    }
+    JNATIVE_FORCEINLINE void adopt_pooled(ThreadContext* thread, Object* object, std::size_t bytes, bool standard_delete) {
+        ManagedArena::adopt_pooled(object, standard_delete);
+        account_allocation(thread, bytes);
+    }
+private:
+    JNATIVE_FORCEINLINE void account_allocation(ThreadContext* thread, std::size_t bytes) {
+        const auto count = thread->queued_allocations.load(std::memory_order_relaxed) + 1;
+        const auto total_bytes = thread->queued_bytes.load(std::memory_order_relaxed) + bytes;
+        thread->queued_allocations.store(count, std::memory_order_relaxed);
+        thread->queued_bytes.store(total_bytes, std::memory_order_relaxed);
+        const auto pending = count - thread->reported_allocations;
+        if (pending == 64 || threshold_.load(std::memory_order_relaxed) < 64) {
+            allocations_.fetch_add(pending, std::memory_order_relaxed);
+            thread->reported_allocations = count;
+        }
+        const auto pending_bytes = total_bytes - thread->reported_bytes;
+        if (pending_bytes >= 65536) {
+            allocation_bytes_.fetch_add(pending_bytes, std::memory_order_relaxed);
+            thread->reported_bytes = total_bytes;
+        }
+    }
+public:
     std::uint64_t retain(Object* object, bool external = false);
     BorrowedSlot* borrow(Object* object);
     void end_borrow(BorrowedSlot* slot) noexcept;
@@ -226,12 +303,16 @@ public:
     void remove_static_root(ManagedField<Object*>* field);
 };
 
-inline Heap& managed_heap() {
+[[noreturn]] JNATIVE_NOINLINE void invalid_managed_execution();
+[[noreturn]] JNATIVE_NOINLINE void invalid_root_frame();
+
+inline ThreadContext* managed_thread() {
     auto thread = current_thread();
     if (!thread || thread->state != ThreadState::running_managed || !thread->heap)
-        throw std::logic_error("Safepoint outside managed execution");
-    return *thread->heap;
+        invalid_managed_execution();
+    return thread;
 }
+inline Heap& managed_heap() { return *managed_thread()->heap; }
 
 // Generated methods validate their managed context at entry. Their loop checks
 // reuse the heap and need the checked slow path only when a collector requests
@@ -321,7 +402,7 @@ template<std::size_t Size> class RootFrame {
 public:
     RootFrame() : thread_(current_thread()), link_{values_, Size, nullptr} {
         if (!thread_ || thread_->state != ThreadState::running_managed)
-            throw std::logic_error("A root frame needs an attached managed thread");
+            invalid_root_frame();
         link_.previous = thread_->root_frames;
         thread_->root_frames = &link_;
     }
@@ -334,6 +415,17 @@ public:
     Heap& heap() const { return *thread_->heap; }
     Object*& slot(std::size_t index) { return values_[index]; }
 };
+
+// Called only after a collection request was observed. Keeping root publication
+// out of line lets a wrapper's ordinary entry remain a small load and branch.
+template<class... References>
+JNATIVE_NOINLINE void poll_with_roots(Heap& heap, References... references) {
+    RootFrame<sizeof...(References)> roots;
+    std::size_t index = 0;
+    for (Object* reference : {static_cast<Object*>(references)...})
+        roots.slot(index++) = reference;
+    heap.poll_if_requested();
+}
 
 // A proven bounded normal path needs no published roots. Its exceptional
 // branches activate this frame before doing any collecting work.
@@ -357,7 +449,7 @@ public:
         if (thread_) return;
         auto current = current_thread();
         if (!current || current->state != ThreadState::running_managed || !current->heap)
-            throw std::logic_error("A root frame needs an attached managed thread");
+            invalid_root_frame();
         thread_ = current;
         link_.previous = thread_->root_frames;
         thread_->root_frames = &link_;
@@ -396,6 +488,25 @@ public:
     RootAddressFrame(const RootAddressFrame&) = delete;
     RootAddressFrame& operator=(const RootAddressFrame&) = delete;
 };
+
+// Built-in drivers can attempt only a compiler-proven bounded callback. A miss
+// performs no Java work; the driver must root live references before a full call.
+template<class Full, class Bounded> class RuntimeCallback {
+    Full full_;
+    Bounded bounded_;
+public:
+    RuntimeCallback(Full full, Bounded bounded) : full_(full), bounded_(bounded) {}
+    template<class... Args> auto operator()(Args... args) const -> decltype(full_(args...)) {
+        return full_(args...);
+    }
+    template<class Result, class... Args> bool try_invoke(Result* result, Args... args) const {
+        return bounded_(result, args...);
+    }
+};
+template<class Full, class Bounded>
+RuntimeCallback<Full, Bounded> make_runtime_callback(Full full, Bounded bounded) {
+    return RuntimeCallback<Full, Bounded>(full, bounded);
+}
 
 template<class T = Object> class FrameRoot {
     Object*& value_;
@@ -460,11 +571,50 @@ public:
     std::uint64_t id() const { return id_; }
 };
 
-template<class T, class... Args> T* allocate(Args&&... args) {
-    Heap::instance().before_allocation();
-    auto object = ::jnative::make_owned<T>(std::forward<Args>(args)...);
-    Heap::instance().adopt(object.get());
+// Preserve ordinary custom native allocation, including overloads which hide
+// Object's arena placement form. Only inherited allocation uses that fast path.
+template<class T, class = void> struct StandardManagedNew : std::false_type {};
+template<class T> struct StandardManagedNew<T,
+        decltype(static_cast<void* (*)(std::size_t)>(&T::operator new),
+                static_cast<void* (*)(std::size_t, ManagedArena*)>(&T::operator new), void())>
+    : std::integral_constant<bool,
+            static_cast<void* (*)(std::size_t)>(&T::operator new)
+                    == static_cast<void* (*)(std::size_t)>(&Object::operator new)
+            && static_cast<void* (*)(std::size_t, ManagedArena*)>(&T::operator new)
+                    == static_cast<void* (*)(std::size_t, ManagedArena*)>(&Object::operator new)> {};
+
+template<class T, class... Args> T* construct_managed(ManagedArena* arena, std::true_type, Args&&... args) {
+    return new (arena) T(std::forward<Args>(args)...);
+}
+template<class T, class... Args> T* construct_managed(ManagedArena*, std::false_type, Args&&... args) {
+    return new T(std::forward<Args>(args)...);
+}
+
+// Native subclasses can supply their own deallocation, including a sized-only
+// overload. Only the inherited ordinary operator permits direct arena release.
+template<class T, class = void> struct StandardManagedDelete : std::false_type {};
+template<class T> struct StandardManagedDelete<T,
+        decltype(static_cast<void (*)(void*)>(&T::operator delete), void())>
+    : std::integral_constant<bool, static_cast<void (*)(void*)>(&T::operator delete)
+            == static_cast<void (*)(void*)>(&Object::operator delete)> {};
+
+// Reuse one validated context through allocation, construction and publication.
+template<class T, class... Args> T* allocate_in(ThreadContext* thread, Args&&... args) {
+    auto& heap = *thread->heap;
+    heap.before_allocation(thread);
+    std::unique_ptr<T> object(construct_managed<T>(thread->arena, StandardManagedNew<T>{},
+            std::forward<Args>(args)...));
+    // Preserve custom native allocation overloads. For inherited ordinary new,
+    // the size class is a compile-time constant and the attached arena owns it.
+    if (ManagedArena::is_small_size(sizeof(T)) && thread->arena
+            && StandardManagedNew<T>::value)
+        heap.adopt_pooled(thread, object.get(), ManagedArena::small_allocation_size(sizeof(T)),
+                StandardManagedDelete<T>::value);
+    else heap.adopt(thread, object.get());
     return object.release();
+}
+template<class T, class... Args> T* allocate(Args&&... args) {
+    return allocate_in<T>(managed_thread(), std::forward<Args>(args)...);
 }
 inline void safepoint() { managed_heap().poll_if_requested(); }
 
@@ -527,6 +677,17 @@ std::uint32_t generated_type_id(const std::string& name);
 bool assignable(const std::string& actual, const std::string& expected);
 bool instance_of(Object* object, const char* expected);
 Object* check_cast(Object* object, const char* expected);
+[[noreturn]] JNATIVE_NOINLINE void fail_cast(Object* object, const char* expected);
+
+// Only emitted for final, generated Java classes. Runtime-owned classes and
+// arrays cannot be instances of these classes; subclasses are forbidden by Java.
+inline bool instance_of_exact(Object* object, const char*, std::uint32_t expected_id) {
+    return object && object->type_id() == expected_id;
+}
+inline Object* check_cast_exact(Object* object, const char* expected, std::uint32_t expected_id) {
+    if (object && object->type_id() != expected_id) fail_cast(object, expected);
+    return object;
+}
 
 // Immutable whole-program ancestry, installed before Java execution begins.
 // Runtime-owned objects and arrays retain the name-based Java type rules.
@@ -562,7 +723,7 @@ inline bool instance_of(Object* object, const char* expected, std::uint32_t expe
     const std::uint32_t actual = object->type_id();
     const auto& table = generated_type_checks;
     if (actual && actual <= table.classes && expected_id && expected_id <= table.classes)
-        return generated_assignable(actual, expected_id);
+        return actual == expected_id || generated_assignable(actual, expected_id);
     return instance_of(object, expected);
 }
 inline Object* check_cast(Object* object, const char* expected, std::uint32_t expected_id) {
@@ -846,16 +1007,16 @@ template<> struct PrimitiveArrayKind<double> {
     static const char* descriptor() { return "[D"; }
 };
 // The enclosing array owns this storage; consumers retain the same get/index API.
-template<class T> class PrimitiveArrayElements {
+template<class T> class ArrayElements {
     OrdinaryField<T>* const data_;
 public:
-    explicit PrimitiveArrayElements(OrdinaryField<T>* data) : data_(data) {}
+    explicit ArrayElements(OrdinaryField<T>* data) : data_(data) {}
     OrdinaryField<T>* get() const { return data_; }
     OrdinaryField<T>& operator[](std::size_t index) const { return data_[index]; }
 };
 template<class T> struct PrimitiveArray final : Array {
     using Field = OrdinaryField<T>;
-    PrimitiveArrayElements<T> elements;
+    ArrayElements<T> elements;
     PrimitiveArray(const PrimitiveArray&) = delete;
     PrimitiveArray& operator=(const PrimitiveArray&) = delete;
     PrimitiveArray(PrimitiveArray&&) = delete;
@@ -885,46 +1046,104 @@ template<class T> struct PrimitiveArray final : Array {
     }
     static PrimitiveArray* create(std::int32_t count, const char*) {
         if (count < 0) raise("java/lang/NegativeArraySizeException");
-        Heap::instance().before_allocation();
-        std::unique_ptr<PrimitiveArray> object(new (count) PrimitiveArray(count));
-        Heap::instance().adopt(object.get());
+        auto thread = managed_thread();
+        auto& heap = *thread->heap;
+        heap.before_allocation(thread);
+        std::unique_ptr<PrimitiveArray> object(new (count, thread->arena) PrimitiveArray(count));
+        heap.adopt(thread, object.get());
         return object.release();
     }
-    static void operator delete(void* block) noexcept { platform::deallocate(block); }
+    static void operator delete(void* block) noexcept { managed_deallocate(block); }
     const char* type_name() const override { return PrimitiveArrayKind<T>::descriptor(); }
     ~PrimitiveArray() override {
         for (std::int32_t i = length; i > 0; --i) elements[i - 1].~Field();
     }
 private:
-    static void* operator new(std::size_t bytes, std::int32_t count) {
+    static void* operator new(std::size_t bytes, std::int32_t count, ManagedArena* arena) {
         if (bytes != sizeof(PrimitiveArray) || count < 0) throw std::bad_array_new_length();
-        return platform::allocate(allocation_size(static_cast<std::size_t>(count)));
+        return managed_allocate_dynamic(allocation_size(static_cast<std::size_t>(count)), arena);
     }
-    static void operator delete(void* block, std::int32_t) noexcept { platform::deallocate(block); }
+    static void operator delete(void* block, std::int32_t, ManagedArena*) noexcept { managed_deallocate(block); }
     static Field* construct_payload(PrimitiveArray* shell, std::int32_t count) {
         static_assert(std::is_nothrow_default_constructible<Field>::value, "Primitive initialization must not throw");
         void* tail = reinterpret_cast<unsigned char*>(shell) + payload_offset();
-        // Begin a real array lifetime, including atomic initialization to Java zero.
+        // Default construction initializes each Field's atomic value_{} to Java
+        // zero. Value-initializing the array as well makes MSVC clear it twice.
+        // Begin a real array lifetime without the redundant aggregate zeroing.
         // Standard nonallocating placement array new has no cookie (CWG2382 DR).
-        return ::new (tail) Field[static_cast<std::size_t>(count)]();
+        return ::new (tail) Field[static_cast<std::size_t>(count)];
     }
     explicit PrimitiveArray(std::int32_t count)
         : Array(count, PrimitiveArrayKind<T>::value), elements(construct_payload(this, count)) {}
 };
 // Selected only for fresh arrays proved to remain inside a method or an
 // entry-thread-owned object, with no untracked aliases.
-// A distinct tag makes accidental use by an ordinary-array helper fail its type check.
+// A distinct tag selects plain access only where the compiler proves confinement.
 template<class T> struct ConfinedPrimitiveArray final : Array {
     static constexpr char kind = PrimitiveArrayKind<T>::value + ('a' - 'A');
-    std::unique_ptr<T[]> elements;
-    ConfinedPrimitiveArray(std::int32_t size, const char*)
-        : Array(size, kind), elements(make_array<T>(size)) {}
+    class Elements {
+        T* const data_;
+    public:
+        explicit Elements(T* data) : data_(data) {}
+        T* get() const { return data_; }
+        T& operator[](std::size_t index) const { return data_[index]; }
+    };
+    Elements elements;
+    ConfinedPrimitiveArray(const ConfinedPrimitiveArray&) = delete;
+    ConfinedPrimitiveArray& operator=(const ConfinedPrimitiveArray&) = delete;
+    static constexpr std::size_t payload_offset() {
+        return (sizeof(ConfinedPrimitiveArray) + alignof(T) - 1) / alignof(T) * alignof(T);
+    }
+    static std::size_t allocation_size(std::size_t count) {
+        static_assert(alignof(ConfinedPrimitiveArray) <= alignof(std::max_align_t), "Array needs fundamental alignment");
+        static_assert(alignof(T) <= alignof(std::max_align_t), "Payload needs fundamental alignment");
+        static_assert(std::is_trivially_destructible<T>::value, "Confined payload must be primitive");
+        if (count > static_cast<std::size_t>(INT32_MAX)
+                || count > (std::numeric_limits<std::size_t>::max() - payload_offset()) / sizeof(T))
+            throw std::bad_array_new_length();
+        return payload_offset() + count * sizeof(T);
+    }
+    static ConfinedPrimitiveArray* create(std::int32_t count, const char*) {
+        if (count < 0) raise("java/lang/NegativeArraySizeException");
+        auto thread = managed_thread();
+        auto& heap = *thread->heap;
+        heap.before_allocation(thread);
+        std::unique_ptr<ConfinedPrimitiveArray> object(new (count, thread->arena) ConfinedPrimitiveArray(count));
+        heap.adopt(thread, object.get());
+        return object.release();
+    }
+    static void operator delete(void* block) noexcept { managed_deallocate(block); }
     const char* type_name() const override { return PrimitiveArrayKind<T>::descriptor(); }
+private:
+    static void* operator new(std::size_t bytes, std::int32_t count, ManagedArena* arena) {
+        if (bytes != sizeof(ConfinedPrimitiveArray) || count < 0) throw std::bad_array_new_length();
+        return managed_allocate_dynamic(allocation_size(static_cast<std::size_t>(count)), arena);
+    }
+    static void operator delete(void* block, std::int32_t, ManagedArena*) noexcept { managed_deallocate(block); }
+    static T* construct_payload(ConfinedPrimitiveArray* shell, std::int32_t count) {
+        void* tail = reinterpret_cast<unsigned char*>(shell) + payload_offset();
+        return ::new (tail) T[static_cast<std::size_t>(count)]();
+    }
+    explicit ConfinedPrimitiveArray(std::int32_t count)
+        : Array(count, kind), elements(construct_payload(this, count)) {}
 };
 template<class T> Object* new_confined_array(const char* descriptor, std::int32_t length) {
-    if (length < 0) raise("java/lang/NegativeArraySizeException");
-    return allocate<ConfinedPrimitiveArray<T>>(length, descriptor);
+    return ConfinedPrimitiveArray<T>::create(length, descriptor);
 }
+template<class T> bool borrowed_confined_array(Object* object) {
+    // Byte/boolean layouts remain excluded from compiler confinement and the
+    // external byte-handle ABI; do not silently broaden that contract.
+    return PrimitiveArrayKind<T>::value != 'B' && PrimitiveArrayKind<T>::value != 'Z'
+            && object && object->array_kind == ConfinedPrimitiveArray<T>::kind;
+}
+inline char java_array_kind(char kind) {
+    switch (kind) {
+        case 'c': case 's': case 'i': case 'j': case 'f': case 'd':
+            return kind - ('a' - 'A');
+        default: return kind;
+    }
+}
+inline std::int32_t array_length(Object* object);
 template<class T> class ConfinedArrayView {
     Object* const object_;
     T* const elements_;
@@ -944,15 +1163,29 @@ template<class T> class ConfinedArrayView {
 public:
     explicit ConfinedArrayView(Object* object) : ConfinedArrayView(object, valid(object)) {}
     Object* object() const { return object_; }
+    std::int32_t length() const {
+        return elements_ ? static_cast<std::int32_t>(length_) : array_length(object_);
+    }
     bool covers(std::int64_t first, std::int64_t last) const {
         return first >= 0 && last >= 0 && first < length_ && last < length_;
     }
     // The generated fast path proves the entire index range before using these.
-    T get_unchecked(std::int32_t index) const { return elements_[index]; }
+    T get_unchecked(std::int32_t index) const {
+        // Copy the object representation so strict-FP compilers can forward
+        // floating bits into byte transfers without a stack spill/reload.
+        T value;
+        if (std::is_floating_point<T>::value) {
+            using Bits = typename std::conditional<sizeof(T) == 4, std::uint32_t, std::uint64_t>::type;
+            Bits bits;
+            std::memcpy(&bits, elements_ + index, sizeof(T));
+            std::memcpy(&value, &bits, sizeof(T));
+        } else value = elements_[index];
+        return value;
+    }
     void set_unchecked(std::int32_t index, T value) const { elements_[index] = value; }
     T get(std::int32_t index) const {
         if (static_cast<std::uint32_t>(index) >= length_) fail();
-        return elements_[index];
+        return get_unchecked(index);
     }
     void set(std::int32_t index, T value) const {
         if (static_cast<std::uint32_t>(index) >= length_) fail();
@@ -966,28 +1199,85 @@ template<class T> void confined_array_set(Object* object, std::int32_t index, T 
     ConfinedArrayView<T>(object).set(index, value);
 }
 struct ReferenceArray final : Array {
-    const std::string descriptor;
-    std::unique_ptr<OrdinaryField<Object*>[]> elements;
+    using Field = OrdinaryField<Object*>;
+    // The shell, atomic references and owned descriptor share one allocation.
+    const char* const descriptor;
+    ArrayElements<Object*> elements;
     const std::uint32_t component_class_id;
     const bool accepts_any_reference;
-    ReferenceArray(std::int32_t size, std::string type);
-    const char* type_name() const override { return descriptor.c_str(); }
+    ReferenceArray(const ReferenceArray&) = delete;
+    ReferenceArray& operator=(const ReferenceArray&) = delete;
+    static constexpr std::size_t payload_offset() {
+        return (sizeof(ReferenceArray) + alignof(Field) - 1) / alignof(Field) * alignof(Field);
+    }
+    Field* data() noexcept {
+        return static_cast<Field*>(static_cast<void*>(reinterpret_cast<unsigned char*>(this) + payload_offset()));
+    }
+    static std::size_t allocation_size(std::size_t count, std::size_t name_size);
+    static ReferenceArray* create(std::int32_t count, const char* type);
+    // Generated allocations already know the component ID. Runtime-owned and
+    // array components use zero and retain the name-based covariance fallback.
+    static ReferenceArray* create(std::int32_t count, const char* type, std::uint32_t component_id);
+    static void operator delete(void* block) noexcept { managed_deallocate(block); }
+    const char* type_name() const override { return descriptor; }
     void trace(Tracer& tracer) override;
+    ~ReferenceArray() override;
+private:
+    ReferenceArray(std::int32_t count, const char* type, std::size_t name_size, std::uint32_t component_id);
+    static void* operator new(std::size_t bytes, std::int32_t count, std::size_t name_size, ManagedArena* arena);
+    static void operator delete(void* block, std::int32_t, std::size_t, ManagedArena*) noexcept { managed_deallocate(block); }
+    static char* construct_descriptor(ReferenceArray* shell, std::int32_t count, const char* type, std::size_t size);
+    static Field* construct_payload(ReferenceArray* shell, std::int32_t count);
 };
 Object* new_array(const char* descriptor, std::int32_t length);
 Object* multi_array(const char* descriptor, const std::vector<std::int32_t>& dimensions, std::size_t depth = 0);
+[[noreturn]] JNATIVE_NOINLINE void invalid_array_operation(const char* message);
 inline std::int32_t array_length(Object* object) {
-    if (!require_non_null(object)->array_kind) throw std::logic_error("Invalid arraylength bytecode");
+    if (!require_non_null(object)->array_kind) invalid_array_operation("Invalid arraylength bytecode");
     return static_cast<Array*>(object)->length;
 }
 void array_copy(Object* source, std::int32_t source_offset, Object* target, std::int32_t target_offset, std::int32_t count);
 namespace detail {
+// Ranges and Java kinds are validated by the caller. At least one payload is
+// confined; mixed representations cannot alias. Select storage outside the loop.
+template<class T> inline void copy_confined_primitive(Array* source, std::int32_t from,
+        Array* target, std::int32_t to, std::int32_t count) {
+    if (!count) return;
+    if (source->array_kind == ConfinedPrimitiveArray<T>::kind) {
+        auto input = static_cast<ConfinedPrimitiveArray<T>*>(source)->elements.get() + from;
+        if (target->array_kind == ConfinedPrimitiveArray<T>::kind) {
+            auto output = static_cast<ConfinedPrimitiveArray<T>*>(target)->elements.get() + to;
+            std::memmove(output, input, static_cast<std::size_t>(count) * sizeof(T));
+        } else {
+            auto output = static_cast<PrimitiveArray<T>*>(target)->data() + to;
+            for (std::int32_t i = 0; i < count; ++i) output[i].set(input[i]);
+        }
+    } else {
+        auto input = static_cast<PrimitiveArray<T>*>(source)->data() + from;
+        auto output = static_cast<ConfinedPrimitiveArray<T>*>(target)->elements.get() + to;
+        for (std::int32_t i = 0; i < count; ++i) output[i] = input[i].get();
+    }
+}
 template<class T> inline bool primitive_array_copy_storage(Object* source, std::int32_t from,
         Object* target, std::int32_t to, std::int32_t count,
         OrdinaryField<T>*& input_elements, OrdinaryField<T>*& output_elements) {
     const char source_kind = require_non_null(source)->array_kind;
     const char target_kind = require_non_null(target)->array_kind;
     if (source_kind != PrimitiveArrayKind<T>::value || target_kind != PrimitiveArrayKind<T>::value) {
+        // The template fixes the Java kind. Avoid general kind-normalization
+        // switches on the mixed path; byte/boolean confinement is unsupported.
+        if (PrimitiveArrayKind<T>::value != 'B' && PrimitiveArrayKind<T>::value != 'Z'
+                && (source_kind == PrimitiveArrayKind<T>::value
+                    || source_kind == ConfinedPrimitiveArray<T>::kind)
+                && (target_kind == PrimitiveArrayKind<T>::value
+                    || target_kind == ConfinedPrimitiveArray<T>::kind)) {
+            auto input = static_cast<Array*>(source);
+            auto output = static_cast<Array*>(target);
+            if (from < 0 || to < 0 || count < 0 || from > input->length - count || to > output->length - count)
+                raise("java/lang/ArrayIndexOutOfBoundsException");
+            copy_confined_primitive<T>(input, from, output, to, count);
+            return false;
+        }
         array_copy(source, from, target, to, count);
         return false;
     }
@@ -1005,16 +1295,20 @@ template<std::int32_t Count, std::int32_t... Indices> struct MakePrimitiveArrayC
 template<std::int32_t... Indices> struct MakePrimitiveArrayCopyIndices<0, Indices...> {
     using type = PrimitiveArrayCopyIndices<Indices...>;
 };
+template<class T> T copy_element(const T& value) { return value; }
+template<class T> T copy_element(const OrdinaryField<T>& value) { return value.get(); }
+template<class T> void copy_element(T& output, T value) { output = value; }
+template<class T> void copy_element(OrdinaryField<T>& output, T value) { output.set(value); }
 // Braced initializer clauses are sequenced left to right in C++11. Each clause
 // completes one atomic load/store pair; expansion needs no recursive calls.
 template<class T, std::int32_t Count> struct PrimitiveArrayCopyExpansion {
-    template<std::int32_t... Indices> static void forward(OrdinaryField<T>* input, OrdinaryField<T>* output,
+    template<class Input, class Output, std::int32_t... Indices> static void forward(Input* input, Output* output,
             PrimitiveArrayCopyIndices<Indices...>) {
-        (void)std::initializer_list<int>{(output[Indices].set(input[Indices].get()), 0)...};
+        (void)std::initializer_list<int>{(copy_element(output[Indices], copy_element(input[Indices])), 0)...};
     }
-    template<std::int32_t... Indices> static void backward(OrdinaryField<T>* input, OrdinaryField<T>* output,
+    template<class Input, class Output, std::int32_t... Indices> static void backward(Input* input, Output* output,
             PrimitiveArrayCopyIndices<Indices...>) {
-        (void)std::initializer_list<int>{(output[Count - Indices - 1].set(input[Count - Indices - 1].get()), 0)...};
+        (void)std::initializer_list<int>{(copy_element(output[Count - Indices - 1], copy_element(input[Count - Indices - 1])), 0)...};
     }
 };
 }
@@ -1063,11 +1357,17 @@ template<class T> PrimitiveArray<T>* primitive_array(Object* object) {
     return static_cast<PrimitiveArray<T>*>(object);
 }
 template<class T> T array_get(Object* object, std::int32_t index) {
+    if (borrowed_confined_array<T>(object))
+        return confined_array_get<T>(object, index);
     auto array = primitive_array<T>(object);
     array->bounds(index);
     return array->elements[index].get();
 }
 template<class T> void array_set(Object* object, std::int32_t index, T value) {
+    if (borrowed_confined_array<T>(object)) {
+        confined_array_set<T>(object, index, value);
+        return;
+    }
     auto array = primitive_array<T>(object);
     array->bounds(index);
     array->elements[index].set(value);
@@ -1075,41 +1375,69 @@ template<class T> void array_set(Object* object, std::int32_t index, T value) {
 // Borrow immutable metadata from a separately rooted, nonmoving Java array.
 // Construction cannot throw: null/type/bounds failures remain at the access,
 // preserving empty loops and the ordering of Java side effects and exceptions.
-template<class T> class PrimitiveArrayView {
+template<class T, bool MayBeConfined = false> class PrimitiveArrayView {
     Object* const object_;
-    OrdinaryField<T>* const elements_;
+    void* const elements_;
+    const bool confined_;
     const std::uint32_t length_;
-    static PrimitiveArray<T>* valid(Object* object) {
-        return object && object->array_kind == PrimitiveArrayKind<T>::value
-            ? static_cast<PrimitiveArray<T>*>(object) : nullptr;
+    static Array* valid(Object* object) {
+        return object && (object->array_kind == PrimitiveArrayKind<T>::value
+                || (MayBeConfined && borrowed_confined_array<T>(object)))
+            ? static_cast<Array*>(object) : nullptr;
     }
-    PrimitiveArrayView(Object* object, PrimitiveArray<T>* array)
-        : object_(object), elements_(array ? array->elements.get() : nullptr),
+    PrimitiveArrayView(Object* object, Array* array)
+        : object_(object), elements_(!array ? nullptr : array->array_kind == PrimitiveArrayKind<T>::value
+                ? static_cast<void*>(static_cast<PrimitiveArray<T>*>(array)->data())
+                : static_cast<void*>(static_cast<ConfinedPrimitiveArray<T>*>(array)->elements.get())),
+          confined_(MayBeConfined && array && array->array_kind == ConfinedPrimitiveArray<T>::kind),
           length_(array ? static_cast<std::uint32_t>(array->length) : 0) {}
     [[noreturn]] static void fail(Object* object) {
-        primitive_array<T>(object);
+        if (!valid(require_non_null(object))) invalid_array_operation("Invalid primitive array access");
         raise("java/lang/ArrayIndexOutOfBoundsException");
     }
 public:
     explicit PrimitiveArrayView(Object* object) : PrimitiveArrayView(object, valid(object)) {}
     Object* object() const { return object_; }
+    std::int32_t length() const {
+        return elements_ ? static_cast<std::int32_t>(length_) : array_length(object_);
+    }
     bool covers(std::int64_t first, std::int64_t last) const {
         return first >= 0 && last >= 0 && first < length_ && last < length_;
     }
-    // Bounds elimination does not change the Java array's atomic representation.
-    T get_unchecked(std::int32_t index) const { return elements_[index].get(); }
-    void set_unchecked(std::int32_t index, T value) const { elements_[index].set(value); }
+    // Representation is immutable. Ordinary arrays always retain atomic access.
+    T get_unchecked(std::int32_t index) const {
+        if (std::is_floating_point<T>::value) {
+            // Join the paths as raw bits before producing a floating value. With
+            // strict FP, joining float expressions makes MSVC spill/reload a
+            // temporary in callers that transfer the value as bytes.
+            using Bits = typename std::conditional<sizeof(T) == 4, std::uint32_t, std::uint64_t>::type;
+            Bits bits;
+            if (MayBeConfined && confined_) std::memcpy(&bits, static_cast<T*>(elements_) + index, sizeof(T));
+            else {
+                T value = static_cast<OrdinaryField<T>*>(elements_)[index].get();
+                std::memcpy(&bits, &value, sizeof(T));
+            }
+            T value;
+            std::memcpy(&value, &bits, sizeof(T));
+            return value;
+        }
+        return MayBeConfined && confined_ ? static_cast<T*>(elements_)[index] : static_cast<OrdinaryField<T>*>(elements_)[index].get();
+    }
+    void set_unchecked(std::int32_t index, T value) const {
+        if (MayBeConfined && confined_) static_cast<T*>(elements_)[index] = value;
+        else static_cast<OrdinaryField<T>*>(elements_)[index].set(value);
+    }
     T get(std::int32_t index) const {
         if (static_cast<std::uint32_t>(index) >= length_) fail(object_);
-        return elements_[index].get();
+        return get_unchecked(index);
     }
     void set(std::int32_t index, T value) const {
         if (static_cast<std::uint32_t>(index) >= length_) fail(object_);
-        elements_[index].set(value);
+        set_unchecked(index, value);
     }
 };
 inline ReferenceArray* reference_array(Object* object) {
-    if (require_non_null(object)->array_kind != 'L') throw std::logic_error("Invalid reference array bytecode");
+    if (require_non_null(object)->array_kind != 'L') invalid_array_operation("Invalid reference array bytecode");
     return static_cast<ReferenceArray*>(object);
 }
 inline Object* reference_get(Object* object, std::int32_t index) {
@@ -1136,16 +1464,39 @@ class ReferenceArrayView {
 public:
     explicit ReferenceArrayView(Object* object) : ReferenceArrayView(object, valid(object)) {}
     Object* object() const { return object_; }
+    std::int32_t length() const {
+        return elements_ ? static_cast<std::int32_t>(length_) : array_length(object_);
+    }
     bool covers(std::int64_t first, std::int64_t last) const {
         return first >= 0 && last >= 0 && first < length_ && last < length_;
     }
-    Object* get_unchecked(std::int32_t index) const { return elements_[index].get(); }
+    Object* get_unchecked(std::int32_t index) const {
+        return elements_[static_cast<std::uint32_t>(index)].get();
+    }
     Object* get(std::int32_t index) const {
         if (static_cast<std::uint32_t>(index) >= length_) fail(object_);
-        return elements_[index].get();
+        return elements_[static_cast<std::uint32_t>(index)].get();
     }
 };
-void reference_set(Object* array, std::int32_t index, Object* value);
+void check_reference_store(ReferenceArray* array, Object* value);
+// Generated proof: exact Object[], a null value, or a compatible value in an
+// array with no narrower runtime component type. Keep null/bounds checks and
+// atomic payload stores; only the proved-unnecessary covariance check is omitted.
+inline void reference_set_exact(Object* object, std::int32_t index, Object* value) {
+    auto array = reference_array(object);
+    array->bounds(index);
+    array->elements[index].set(value);
+}
+inline void reference_set(Object* object, std::int32_t index, Object* value) {
+    auto array = reference_array(object);
+    array->bounds(index);
+    // Keep null/Object[] stores visible to the native optimizer. The helper
+    // preserves covariance for typed arrays, including nested array classes.
+    if (value && !array->accepts_any_reference
+            && (!array->component_class_id || value->type_id() != array->component_class_id))
+        check_reference_store(array, value);
+    array->elements[index].set(value);
+}
 std::int32_t byte_get(Object* array, std::int32_t index);
 void byte_set(Object* array, std::int32_t index, std::int32_t value);
 Object* arguments(int argc, char** argv);
@@ -1173,6 +1524,7 @@ void string_from_chars(Object* string, Object* characters);
 void string_from_chars(Object* string, Object* characters, std::int32_t offset, std::int32_t count);
 void initialize_runtime();
 std::int32_t identity_hash(Object* object);
+bool try_object_hash(std::int32_t* result, Object* object) noexcept;
 Object* object_string(Object* object);
 bool object_equals(Object* object, Object* other);
 std::int32_t object_hash(Object* object);

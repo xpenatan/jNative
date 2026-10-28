@@ -72,7 +72,7 @@ class TypeChecksTest {
                                     throw new IllegalStateException("Java method called during C++ shell construction");
                                 }
                             }
-                            static class Uninitialized {
+                            static final class Uninitialized {
                                 static { if (true) throw new IllegalStateException("type check initialized a class"); }
                             }
                             static boolean marker(Object value, int marker) {
@@ -80,6 +80,12 @@ class TypeChecksTest {
                             }
                             static boolean reflectedInstance(Class<?> type, Object value) {
                                 return type.isInstance(value);
+                            }
+                            static boolean exact(Object value) { return value instanceof Child; }
+                            static Child exactCast(Object value) { return (Child) value; }
+                            static Object exactCastOrKeep(Object value, Object kept) {
+                                try { return exactCast(value); }
+                                catch (ClassCastException expected) { System.gc(); return kept; }
                             }
                             static Object castOrKeep(Class<?> type, Object value, Object kept) {
                                 try { return type.cast(value); }
@@ -118,6 +124,15 @@ class TypeChecksTest {
                                     new Object(), ByteBuffer.allocateDirect(4), Child.class};
                                 long checksum = 0;
                                 for (Object value : values) {
+                                    boolean isChild = value != null && value.getClass() == Child.class;
+                                    if (exact(value) != isChild) throw new AssertionError();
+                                    try {
+                                        if (exactCast(value) != value || value != null && !isChild)
+                                            throw new AssertionError();
+                                    } catch (ClassCastException expected) {
+                                        if (value == null || isChild) throw expected;
+                                    }
+                                    if (value instanceof Uninitialized) throw new AssertionError();
                                     System.out.println(inspect(value));
                                     for (int i = 0; i < 70; i++) if (marker(value, i)) checksum += i + 1;
                                 }
@@ -159,6 +174,7 @@ class TypeChecksTest {
                                 }
                                 System.out.println("reflection:" + reflectedResult);
                                 Object kept = new String("survived cast failure");
+                                if (exactCastOrKeep(new Base(), kept) != kept) throw new AssertionError();
                                 System.out.println(castOrKeep(Child.class, new Base(), kept));
                                 Class<?> missing = null;
                                 try { missing.cast(null); }
@@ -252,6 +268,18 @@ class TypeChecksTest {
         assertTrue(
                 Files.readString(output.resolve("classes/TypeChecks.cpp")).contains("::class_id"));
         String effects = Files.readString(output.resolve("method-effects.tsv"));
+        String cpp = Files.readString(output.resolve("classes/TypeChecks.cpp"));
+        for(String member : List.of("exact", "exactCast")) {
+            assertTrue(effects.lines().anyMatch(line -> line.contains("TypeChecks." + member + "(")
+                    && line.contains("bounded")), effects);
+            String start = member.equals("exact") ? "\nstd::int32_t TypeChecks::exact("
+                    : "\n::jnative::Object* TypeChecks::exactCast(";
+            int at = cpp.indexOf(start);
+            assertTrue(at >= 0, start);
+            String method = cpp.substring(at, cpp.indexOf("\n}", at));
+            assertFalse(method.contains("gc_roots") || method.contains("safepoint"), method);
+            assertTrue(method.contains(member.equals("exact") ? "instance_of_exact(" : "check_cast_exact("), method);
+        }
         assertTrue(
                 effects.lines()
                         .anyMatch(

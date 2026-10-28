@@ -83,6 +83,9 @@ class FloatingPointLoweringTest {
                                 return value;
                             }
                             static void floats(float a, float b) {
+                                mix(Float.floatToIntBits(a + b)); mix(Float.floatToIntBits(a - b));
+                                mix(Float.floatToIntBits(a * b)); mix(Float.floatToIntBits(a / b));
+                                mix(Float.floatToIntBits(a * b + a));
                                 mix(a < b ? 1 : 0); mix(a <= b ? 1 : 0); mix(a > b ? 1 : 0);
                                 mix(a >= b ? 1 : 0); mix(a == b ? 1 : 0); mix(a != b ? 1 : 0);
                                 mix(!(a < b) ? 1 : 0); mix(!(a >= b) ? 1 : 0);
@@ -92,6 +95,9 @@ class FloatingPointLoweringTest {
                                 FLOAT_CALLS
                             }
                             static void doubles(double a, double b) {
+                                mix(Double.doubleToLongBits(a + b)); mix(Double.doubleToLongBits(a - b));
+                                mix(Double.doubleToLongBits(a * b)); mix(Double.doubleToLongBits(a / b));
+                                mix(Double.doubleToLongBits(a * b + a));
                                 mix(a < b ? 1 : 0); mix(a <= b ? 1 : 0); mix(a > b ? 1 : 0);
                                 mix(a >= b ? 1 : 0); mix(a == b ? 1 : 0); mix(a != b ? 1 : 0);
                                 mix(!(a > b) ? 1 : 0); mix(!(a <= b) ? 1 : 0);

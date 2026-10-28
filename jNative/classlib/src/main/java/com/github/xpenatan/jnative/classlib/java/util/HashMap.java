@@ -14,6 +14,10 @@ public class HashMap<K, V> extends AbstractMap<K, V>
     private Node<K, V> head, tail;
     private int count, changes;
     private final float loadFactor;
+    private float growthThreshold;
+    private transient Set<K> keysView;
+    private transient Collection<V> valuesView;
+    private transient Set<Entry<K, V>> entriesView;
 
     public HashMap() {
         this(16, 0.75f);
@@ -29,6 +33,7 @@ public class HashMap<K, V> extends AbstractMap<K, V>
         int size = capacityNative(capacity);
         buckets = (Node<K, V>[])new Node[size];
         this.loadFactor = loadFactor;
+        growthThreshold = size * loadFactor;
     }
 
     public HashMap(Map<? extends K, ? extends V> values) {
@@ -80,17 +85,17 @@ public class HashMap<K, V> extends AbstractMap<K, V>
     }
 
     protected boolean keysEqual(Object first, Object second) {
-        return Objects.equals(first, second);
+        return first == second || first != null && first.equals(second);
     }
 
     protected int hash(Object key) {
-        int hash = Objects.hashCode(key);
+        int hash = key == null ? 0 : key.hashCode();
         return hash ^ (hash >>> 16);
     }
 
     @SuppressWarnings("unchecked")
     private Node<K, V> find(Object key) {
-        return (Node<K, V>)findNative(this, key);
+        return (Node<K, V>)lookupNative(this, key, false);
     }
 
     public int size() {
@@ -101,9 +106,9 @@ public class HashMap<K, V> extends AbstractMap<K, V>
         return find(key) != null;
     }
 
+    @SuppressWarnings("unchecked")
     public V get(Object key) {
-        Node<K, V> node = find(key);
-        return node == null ? null : node.value;
+        return (V)lookupNative(this, key, true);
     }
 
     @SuppressWarnings("unchecked")
@@ -131,36 +136,46 @@ public class HashMap<K, V> extends AbstractMap<K, V>
     @NativeImport(value = "jnative::hashmap_capacity", managed = true, runtimeOnly = true, bounded = true)
     private static native int capacityNative(int capacity);
 
-    @NativeImport(value = "jnative::hashmap_find", managed = true, runtimeOnly = true, managesRoots = true, callbacksSynchronous = true,
-            callbacks = {"java/util/HashMap.hash(Ljava/lang/Object;)I",
-                    "java/util/HashMap.keysEqual(Ljava/lang/Object;Ljava/lang/Object;)Z"},
-            callbackKinds = {NativeImport.Invocation.VIRTUAL, NativeImport.Invocation.VIRTUAL},
+    private static Object lookup(HashMap self, Object key, boolean returnValue) {
+        int hash = self.hash(key);
+        Node node = self.buckets[hash & (self.buckets.length - 1)];
+        while (node != null) {
+            if (node.hash == hash && self.keysEqual(key, node.key))
+                return returnValue ? node.value : node;
+            node = node.next;
+        }
+        return null;
+    }
+
+    @NativeImport(value = "jnative::hashmap_lookup", managed = true, runtimeOnly = true,
+            managesRoots = true, callbacksSynchronous = true, boundedCallbacks = true,
+            callbacks = {"java/util/HashMap.lookup(Ljava/util/HashMap;Ljava/lang/Object;Z)Ljava/lang/Object;",
+                    "java/lang/Object.hashCode()I", "java/lang/Object.equals(Ljava/lang/Object;)Z"},
+            callbackKinds = {NativeImport.Invocation.STATIC, NativeImport.Invocation.VIRTUAL, NativeImport.Invocation.VIRTUAL},
             fields = {"java/util/HashMap.buckets:[Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
-                    "java/util/HashMap.head:Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
-                    "java/util/HashMap.tail:Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
-                    "java/util/HashMap.count:I",
-                    "java/util/HashMap.changes:I",
-                    "java/util/HashMap.loadFactor:F",
                     "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.hash:I",
                     "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.key:Ljava/lang/Object;",
                     "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.value:Ljava/lang/Object;",
-                    "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.next:Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
-                    "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.before:Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
-                    "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.after:Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;"})
-    private static native Node findNative(HashMap self, Object key);
+                    "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.next:Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;"})
+    private static native Object lookupNative(HashMap self, Object key, boolean returnValue);
 
-    @NativeImport(value = "jnative::hashmap_put", managed = true, runtimeOnly = true, managesRoots = true, callbacksSynchronous = true,
+    @NativeImport(value = "jnative::hashmap_put", managed = true, runtimeOnly = true, managesRoots = true,
+            callbacksSynchronous = true, boundedCallbacks = true,
             callbacks = {"java/util/HashMap.hash(Ljava/lang/Object;)I",
                     "java/util/HashMap.keysEqual(Ljava/lang/Object;Ljava/lang/Object;)Z",
                     "java/util/HashMap.newNode(ILjava/lang/Object;Ljava/lang/Object;Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;)Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
-                    "java/util/HashMap.newBuckets(I)[Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;"},
-            callbackKinds = {NativeImport.Invocation.VIRTUAL, NativeImport.Invocation.VIRTUAL, NativeImport.Invocation.STATIC, NativeImport.Invocation.STATIC},
+                    "java/util/HashMap.newBuckets(I)[Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
+                    "java/lang/Object.hashCode()I", "java/lang/Object.equals(Ljava/lang/Object;)Z"},
+            callbackKinds = {NativeImport.Invocation.VIRTUAL, NativeImport.Invocation.VIRTUAL,
+                    NativeImport.Invocation.STATIC, NativeImport.Invocation.STATIC,
+                    NativeImport.Invocation.VIRTUAL, NativeImport.Invocation.VIRTUAL},
             fields = {"java/util/HashMap.buckets:[Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
                     "java/util/HashMap.head:Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
                     "java/util/HashMap.tail:Lcom/github/xpenatan/jnative/classlib/java/util/HashMap$Node;",
                     "java/util/HashMap.count:I",
                     "java/util/HashMap.changes:I",
                     "java/util/HashMap.loadFactor:F",
+                    "java/util/HashMap.growthThreshold:F",
                     "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.hash:I",
                     "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.key:Ljava/lang/Object;",
                     "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.value:Ljava/lang/Object;",
@@ -179,6 +194,7 @@ public class HashMap<K, V> extends AbstractMap<K, V>
                     "java/util/HashMap.count:I",
                     "java/util/HashMap.changes:I",
                     "java/util/HashMap.loadFactor:F",
+                    "java/util/HashMap.growthThreshold:F",
                     "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.hash:I",
                     "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.key:Ljava/lang/Object;",
                     "com/github/xpenatan/jnative/classlib/java/util/HashMap$Node.value:Ljava/lang/Object;",
@@ -231,7 +247,8 @@ public class HashMap<K, V> extends AbstractMap<K, V>
     }
 
     public Set<K> keySet() {
-        return new Keys();
+        if(keysView == null) keysView = new Keys();
+        return keysView;
     }
 
     private class Keys extends AbstractSet<K> {
@@ -259,7 +276,8 @@ public class HashMap<K, V> extends AbstractMap<K, V>
     }
 
     public Collection<V> values() {
-        return new Values();
+        if(valuesView == null) valuesView = new Values();
+        return valuesView;
     }
 
     private class Values extends AbstractCollection<V> {
@@ -277,7 +295,8 @@ public class HashMap<K, V> extends AbstractMap<K, V>
     }
 
     public Set<Entry<K, V>> entrySet() {
-        return new Entries();
+        if(entriesView == null) entriesView = new Entries();
+        return entriesView;
     }
 
     private class Entries extends AbstractSet<Entry<K, V>> {

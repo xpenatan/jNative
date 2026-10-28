@@ -45,10 +45,11 @@ public final class Integer extends Number implements Comparable<Integer> {
     @NativeImport(value = "jnative::integer_hex", managed = true, runtimeOnly = true)
     public static native String toHexString(int value);
 
-    private static final Integer[] CACHE = new Integer[256];
-
-    static {
-        for(int i = 0; i < 256; ++i) CACHE[i] = new Integer(i - 128);
+    private static final class Cache {
+        static final Integer[] VALUES = new Integer[256];
+        static {
+            for(int i = 0; i < VALUES.length; ++i) VALUES[i] = new Integer(i - 128);
+        }
     }
 
     public Integer(int value) {
@@ -56,7 +57,8 @@ public final class Integer extends Number implements Comparable<Integer> {
     }
 
     public static Integer valueOf(int value) {
-        return value >= -128 && value <= 127 ? CACHE[(int)value + 128] : new Integer(value);
+        if(value >= -128 && value <= 127) return Cache.VALUES[value + 128];
+        return new Integer(value);
     }
 
     public int intValue() {
@@ -88,7 +90,7 @@ public final class Integer extends Number implements Comparable<Integer> {
     }
 
     public int hashCode() {
-        return hashCode(value);
+        return value;
     }
 
     public static int hashCode(int value) {

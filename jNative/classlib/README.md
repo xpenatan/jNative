@@ -50,6 +50,17 @@ contract does not imply `bounded`.
 The initialization proof recognizes the runtime's `Cloneable` and `Serializable`
 marker interfaces; other unmodeled platform ancestors retain the normal boundary.
 
+Integer, long, byte, short and character boxing caches live in private lazy
+holders. Primitive parsing, formatting and numeric helpers do not initialize or
+make those caches reachable. Cached `valueOf` calls retain their shared identities
+and normal class-initialization publication across threads.
+
+HashMap caches its live key, value and entry views on first use; LinkedHashMap
+inherits those views. Cursors still observe changes and preserve removal and
+fail-fast behavior. Native lookup and insertion use the private bucket table's
+nonempty power-of-two capacity to avoid redundant masked-index bounds checks.
+The floating resize threshold is cached at construction and after growth.
+
 Managed import metadata declares callback signatures and dispatch kinds, typed
 instance-field accessors, and types created or thrown only by native code.
 Source-class virtual callbacks use generated C++ virtual members, preserving
@@ -68,6 +79,16 @@ must prove dispatch, initialization and exception-visible reference safety befor
 inlining it. `runtimeOnly` limits access to runtime representations, declared
 fields and declared callbacks, allowing the ownership analysis to stay precise.
 General native imports remain conservative.
+
+`boundedAttempt` names an optional `bool(Return*, arguments...)` runtime helper.
+It either completes a bounded, noncollecting operation or declines without
+changing state; neither outcome may allocate, poll, block, throw or call Java.
+The ordinary import retains its full effects. Opted-in `boundedCallbacks` drivers
+can use this helper after the compiler validates the effective platform binding,
+helper initialization and exact receiver dispatch. Generated overrides cannot
+fall through to a native base implementation. Object hashing uses this for
+identity hashes and already-cached string hashes; string substitutions and
+uncached strings retain the full callback.
 
 `registeredReflection` limits generated-field access and generated behavior to
 emitted reflection registrations, alongside runtime representations and declared

@@ -1,6 +1,9 @@
 #include "jn_string_kernels.hpp"
 #include "jn_classlib_numbers.hpp"
 #include <algorithm>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#endif
 
 namespace jnative {
 namespace {
@@ -11,7 +14,11 @@ class StringPoll {
     std::int32_t remaining_ = 1024;
 public:
     void step() {
-        if (--remaining_ == 0) {
+        advance(1);
+    }
+    void advance(std::int32_t work) {
+        remaining_ -= work;
+        if (remaining_ <= 0) {
             safepoint_.poll();
             remaining_ = 1024;
         }
@@ -85,6 +92,71 @@ bool matches_code_point(String* text, std::int32_t index, std::int32_t value) {
         && text->value[index] == static_cast<char16_t>(0xd800 + (code >> 10))
         && text->value[index + 1] == static_cast<char16_t>(0xdc00 + (code & 1023));
 }
+
+// Filter candidate starts with the first pair and the end of the needle. This
+// avoids full comparisons when common or correlated end characters match but
+// the adjacent character does not. All loads stay within the caller's valid
+// candidate range, including the shifted end load.
+const char16_t* search_candidate(const char16_t* text, std::int32_t count,
+                                 const char16_t* needle, std::int32_t size) {
+    if (size == 1) return std::char_traits<char16_t>::find(text, count, needle[0]);
+    const auto last = size - 1;
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+    const auto head = _mm_set1_epi16(static_cast<short>(needle[0]));
+    const auto tail = _mm_set1_epi16(static_cast<short>(needle[last]));
+    const auto second = _mm_set1_epi16(static_cast<short>(needle[1]));
+    while (count >= 8) {
+        const auto heads = _mm_loadu_si128(reinterpret_cast<const __m128i*>(text));
+        const auto tails = _mm_loadu_si128(reinterpret_cast<const __m128i*>(text + last));
+        auto matches = _mm_and_si128(_mm_cmpeq_epi16(heads, head), _mm_cmpeq_epi16(tails, tail));
+        if (size > 2) {
+            const auto seconds = _mm_loadu_si128(reinterpret_cast<const __m128i*>(text + 1));
+            matches = _mm_and_si128(matches, _mm_cmpeq_epi16(seconds, second));
+        }
+        const auto mask = static_cast<unsigned>(_mm_movemask_epi8(matches));
+        if (mask) {
+            for (unsigned lane = 0; lane < 8; ++lane)
+                if (mask & (1u << (lane * 2))) return text + lane;
+        }
+        text += 8;
+        count -= 8;
+    }
+#endif
+    for (; count > 0; --count, ++text)
+        if (text[0] == needle[0] && text[last] == needle[last]
+                && (size == 2 || text[1] == needle[1])) return text;
+    return nullptr;
+}
+
+// Used only after repeated prefix matches make the allocation-free search do
+// excessive work. Both prefix construction and matching are linear in UTF-16
+// units, including inputs with long periodic prefixes. The caller roots inputs.
+std::int32_t search_with_prefix_table(const std::u16string& text, const std::u16string& needle,
+                                     std::int32_t begin, StringPoll& poll) {
+    const auto size = static_cast<std::int32_t>(needle.size());
+    std::vector<std::int32_t> prefix(static_cast<std::size_t>(size));
+    std::int32_t matched = 0;
+    for (std::int32_t i = 1; i < size; ++i) {
+        while (matched != 0 && needle[i] != needle[matched]) {
+            matched = prefix[matched - 1];
+            poll.step();
+        }
+        if (needle[i] == needle[matched]) ++matched;
+        prefix[i] = matched;
+        poll.step();
+    }
+    matched = 0;
+    for (auto i = begin; i < static_cast<std::int32_t>(text.size()); ++i) {
+        while (matched != 0 && text[i] != needle[matched]) {
+            matched = prefix[matched - 1];
+            poll.step();
+        }
+        if (text[i] == needle[matched]) ++matched;
+        if (matched == size) return i - size + 1;
+        poll.step();
+    }
+    return -1;
+}
 }
 
 Object* string_to_char_array(Object* object) {
@@ -130,10 +202,35 @@ std::int32_t string_index_of_text(Object* object, Object* part, std::int32_t sta
     if (needle_size == 0) return std::min(begin, size);
     const auto limit = size - needle_size;
     StringPoll poll;
-    for (auto i = begin; i <= limit; ++i) {
+    if (size <= 32) {
+        // At most 32*32 comparisons after the entry poll. Avoid bulk-search
+        // setup and per-character polling for these bounded tiny inputs.
+        for (auto i = begin; i <= limit; ++i) {
+            std::int32_t j = 0;
+            while (j < needle_size && text->value[i + j] == needle->value[j]) ++j;
+            if (j == needle_size) return i;
+        }
+        return -1;
+    }
+    std::uint64_t comparisons = 0;
+    const auto candidate_work = needle_size > 2 ? 3 : 2;
+    const auto chunk = 1024 / candidate_work;
+    for (auto i = begin; i <= limit;) {
+        // Search bounded immutable chunks; charge every candidate comparison.
+        // Rooted strings do not move; polling never invalidates these pointers.
+        const auto count = std::min(chunk, limit - i + 1);
+        const auto* first = text->value.data() + i;
+        const auto* found = search_candidate(first, count, needle->value.data(), needle_size);
+        const auto scanned = found ? static_cast<std::int32_t>(found - first) + 1 : count;
+        poll.advance(scanned * candidate_work);
+        comparisons += scanned * candidate_work;
+        if (!found) { i += count; continue; }
+        i += scanned - 1;
         bool match = true;
-        for (std::int32_t j = 0; j < needle_size; ++j) {
+        // The filter already matched positions 0, 1 and the last position.
+        for (std::int32_t j = 2; j < needle_size - 1; ++j) {
             const bool same = text.get()->value[i + j] == needle.get()->value[j];
+            ++comparisons;
             poll.step();
             if (!same) {
                 match = false;
@@ -141,6 +238,11 @@ std::int32_t string_index_of_text(Object* object, Object* part, std::int32_t sta
             }
         }
         if (match) return i;
+        // Include the needle length so an early match keeps its cheap path.
+        // Checking after each failed candidate bounds the prefix work by O(n+m).
+        if (i < limit && comparisons > UINT64_C(4) * (static_cast<std::uint64_t>(i - begin) + needle_size))
+            return search_with_prefix_table(text->value, needle->value, i + 1, poll);
+        ++i;
     }
     return -1;
 }

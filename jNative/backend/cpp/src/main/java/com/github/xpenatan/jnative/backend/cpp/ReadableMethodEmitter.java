@@ -17,6 +17,7 @@ import org.objectweb.asm.tree.analysis.SourceInterpreter;
 
 import java.util.*;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * Reconstructs typed values and structured regions before printing C++. Effectful values are
@@ -54,6 +55,7 @@ final class ReadableMethodEmitter {
                             "synchronized_return",
                             "loop_safepoints",
                             "gc_roots",
+                            "entry_heap",
                             "self"));
     private final List<Value> stack = new ArrayList<>();
 
@@ -80,17 +82,21 @@ final class ReadableMethodEmitter {
     private final BitSet monitorHandlers = new BitSet();
     private final Map<Block, String> exitLabels = new LinkedHashMap<>();
     private final Map<ArrayViewKey, String> arrayViews = new LinkedHashMap<>();
+    private final Map<ArrayViewKey, String> arrayLengths = new LinkedHashMap<>();
     private final Set<ArrayViewKey> uncheckedArrayViews = new HashSet<>();
     private final boolean splitExceptionRegions;
     private final boolean initializedEntry;
     private final boolean tailFastPath;
     private final boolean boundedFastPath;
     private final Set<String> delegationInitializers;
-    private final boolean rootedReferences;
+    private boolean rootedReferences;
+    private boolean entryOnlyRoots;
     private final boolean boundedNormalReturn;
     private final boolean deferredRoots;
     private final Set<Step> exceptionalSteps = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<AbstractInsnNode> confinedArrays;
+    private final Set<AbstractInsnNode> ordinaryArrays;
+    private final Map<AbstractInsnNode, Type> arrayTypes;
     private Block block;
     private int sourceLine;
     private int emittedBlocks;
@@ -152,8 +158,12 @@ final class ReadableMethodEmitter {
         // locals eagerly even if every handler ultimately throws again.
         this.deferredRoots = boundedNormalReturn && method.bytecode().tryCatchBlocks.isEmpty();
         this.confinedArrays =
-                new HashSet<>(ConfinedArrays.analyze(method.id().owner(), method.bytecode()));
+                new HashSet<>(backend.confinedArrayInstructions(method));
         this.confinedArrays.addAll(backend.ownedArrayInstructions(method.id()));
+        var storage = backend.arrayStorage(method, confinedArrays);
+        this.ordinaryArrays = storage.ordinary();
+        this.confinedArrays.addAll(storage.confined());
+        this.arrayTypes = ArrayTypes.analyze(method.id().owner(), method.bytecode());
     }
 
     /**
@@ -222,6 +232,14 @@ final class ReadableMethodEmitter {
                 fail("bounded returning warm lowering lost scoped failure publication");
             lazyRoots = analyzeLazyRoots(body);
             scopedRejoiningRoots = !lazyRoots && analyzeRejoiningRoots(body);
+            entryOnlyRoots = !lazyRoots && analyzeEntryOnlyRoots();
+            if(entryOnlyRoots && !scopedRejoiningRoots) {
+                rootedReferences = false;
+                for(Local local : locals.values()) local.rootedReferences = false;
+                for(Block current : blocks) for(Step step : current.steps)
+                    if(step.value != null) step.value.canonical().rootedReferences = false;
+                for(Value value : sharedValues) value.rootedReferences = false;
+            }
             scopedColdRoots |= scopedRejoiningRoots || lazyRoots;
             if(scopedRejoiningRoots || lazyRoots && !collectingBranches.isEmpty()) {
                 // The new arm-entry poll precedes every operation in the arm,
@@ -306,6 +324,23 @@ final class ReadableMethodEmitter {
             // Calls can form unbounded recursion without a loop backedge. Publish
             // receiver/argument roots before polling at method entry as well.
             int entryPollPosition = out.length();
+            if(entryOnlyRoots && !scopedRejoiningRoots) {
+                // No reference survives a protected call. Publish entry arguments
+                // only on the requested-collection path, before entering the collector.
+                List<String> entryValues = new ArrayList<>();
+                if((method.bytecode().access & ACC_STATIC) == 0)
+                    entryValues.add(backend.isInterface(owner) ? "self" : "static_cast<::jnative::Object*>(this)");
+                for(Local parameter : parameters)
+                    if(reference(parameter.type)) entryValues.add(parameter.name);
+                writer.line(1, "auto& entry_heap = ::jnative::managed_heap();");
+                writer.line(1, "if (entry_heap.collection_pending()) {");
+                if(!entryValues.isEmpty()) {
+                    writer.line(2, "::jnative::poll_with_roots(entry_heap, "
+                            + String.join(", ", entryValues) + ");");
+                }
+                else writer.line(2, "entry_heap.poll_if_requested();");
+                writer.line(1, "}");
+            }
             boolean entryPollPublished = rootedReferences && !boundedNormalReturn
                     && !scopedRejoiningRoots && !lazyRoots;
             Set<String> entryPublishedRoots = Set.copyOf(writer.entryRoots);
@@ -316,6 +351,7 @@ final class ReadableMethodEmitter {
                                 : "    ::jnative::LoopSafepoint loop_safepoints;\n");
             int entryPollEnd = out.length();
             if((method.bytecode().access & ACC_STATIC) != 0
+                    && !backend.emptyInitialization(owner)
                     && !initializedEntry
                     && !boundedFastPath
                     && !method.id().name().equals("<clinit>")) {
@@ -420,24 +456,29 @@ final class ReadableMethodEmitter {
             out.append("}\n\n");
             MethodEffects.Summary cooperativeWork = scopedRejoiningRoots
                     ? backend.cooperativeWork(method.id(), rejoiningInstructions) : null;
+            boolean initializationProtected = initializedEntry || backend.emptyInitialization(owner)
+                    || writer.initializationPublished;
             boolean protectsArguments = scopedRejoiningRoots
                     && cooperativeWork != null && cooperativeWork.bounded()
                     && (method.bytecode().access & ACC_STATIC) != 0
                     && Type.getReturnType(method.id().descriptor()).equals(Type.VOID_TYPE)
-                    && writer.argumentsPublished && (initializedEntry || writer.initializationPublished)
+                    && writer.argumentsPublished && initializationProtected
                     && writer.publishedBranches.containsAll(collectingBranches);
-            boolean protectsEntryArguments = entryPollPublished
+            boolean protectsEntryArguments = entryOnlyRoots || entryPollPublished
                     && parameters.stream().filter(parameter -> reference(parameter.type))
                     .allMatch(parameter -> entryPublishedRoots.contains(parameter.name))
                     && ((method.bytecode().access & ACC_STATIC) != 0
                     || entryPublishedRoots.contains("keep_alive"));
             boolean protectsTerminalArguments = lazyRoots && writer.terminalArgumentsPublished
                     && ((method.bytecode().access & ACC_STATIC) == 0
-                    || initializedEntry || writer.initializationPublished)
+                    || initializationProtected)
                     && writer.publishedBranches.containsAll(collectingBranches)
                     && writer.publishedLazyLoops.containsAll(lazyLoops)
                     && writer.protectedCopies.containsAll(lazyGuardedCopies);
             boolean boundedWarmEntry = !tailFastPath && !boundedFastPath && boundedNormalReturn
+                    // A root-free body already checks initialization in place.
+                    // Duplicating it adds guards without avoiding any root work.
+                    && rootSlots > 0
                     && !backend.initializationDependencies(method.id()).isEmpty()
                     && !method.id().name().startsWith("<")
                     && method.bytecode().tryCatchBlocks.isEmpty() && monitorEntries.isEmpty()
@@ -457,7 +498,8 @@ final class ReadableMethodEmitter {
                 Set<String> initialized = new TreeSet<>(boundedWarmEntry
                         ? backend.initializationDependencies(method.id()) : delegationInitializers);
                 // Ordinary static entry can initialize its own class before reaching the prefix.
-                if(!initializedEntry && (method.bytecode().access & ACC_STATIC) != 0)
+                if(!initializedEntry && !backend.emptyInitialization(owner)
+                        && (method.bytecode().access & ACC_STATIC) != 0)
                     initialized.add(owner);
                 String guard = String.join(" && ", initialized.stream().map(dependency ->
                         classReference(dependency)
@@ -665,11 +707,22 @@ final class ReadableMethodEmitter {
             if(branch.block.condition.expression.collects()) return false;
             for(Node arm : Arrays.asList(branch.yes, branch.no)) {
                 if(arm == null) continue;
+                // First cover only nested collecting arms. A guard around a
+                // rare allocation must not publish roots on its common path.
+                // Roll back partial coverage if an unconditional collection in
+                // the remainder requires publishing the complete outer arm.
+                List<Node> previousBranches = new ArrayList<>(collectingBranches);
+                Set<Block> previousBlocks = new HashSet<>(scopedBlocks);
+                if(findCollectingBranches(arm, scopedBlocks)) continue;
+                collectingBranches.clear();
+                collectingBranches.addAll(previousBranches);
+                scopedBlocks.clear();
+                scopedBlocks.addAll(previousBlocks);
                 if(containsCollection(arm)) {
                     collectingBranches.add(arm);
                     collectRegionBlocks(arm, scopedBlocks);
                 }
-                else if(!findCollectingBranches(arm, scopedBlocks)) return false;
+                else return false;
             }
             return true;
         }
@@ -726,7 +779,7 @@ final class ReadableMethodEmitter {
                 addReferenceUses(step.expression, live, byName);
                 if(step.expression.collects()) {
                     Set<Object> boundary = new HashSet<>(live);
-                    boundary.removeAll(handoffOperands(current, step, liveAfter));
+                    boundary.removeAll(handoffOperands(current, step, liveAfter, byName));
                     required.addAll(boundary);
                 }
             }
@@ -790,14 +843,14 @@ final class ReadableMethodEmitter {
         return false;
     }
 
-    private Set<Value> handoffOperands(Block current, Step step, Set<Object> liveAfter) {
-        Expr expression = step.expression;
+    private Set<Value> handoffOperands(Block current, Step step, Set<Object> liveAfter, Map<String, Local> byName) {
         if(!method.bytecode().tryCatchBlocks.isEmpty() || !monitorEntries.isEmpty()
-                || (method.bytecode().access & ACC_SYNCHRONIZED) != 0
-                || expression.generatedCall == null
-                || !backend.protectsCallArguments(expression.generatedCall)
-                || expression.values.stream().anyMatch(value -> value.inline && value.expression.collects()))
+                || (method.bytecode().access & ACC_SYNCHRONIZED) != 0)
             return Set.of();
+        List<Expr> calls = new ArrayList<>(1);
+        if(protectedCalls(step.expression, byName, backend::protectsCallArguments, calls) != 1)
+            return Set.of();
+        Expr expression = calls.getFirst();
         Set<Value> result = Collections.newSetFromMap(new IdentityHashMap<>());
         for(Value operand : expression.values) {
             Value value = operand.canonical();
@@ -840,7 +893,11 @@ final class ReadableMethodEmitter {
                 Block current = blocks.get(blockIndex);
                 Set<Object> live = new HashSet<>();
                 for(Block next : current.successors()) live.addAll(incoming.get(next));
-                if(!loops.isEmpty()) required.addAll(live);
+                // LoopNode polls at the loop header (after a simple head test,
+                // before a complex head/body). Other blocks do not introduce a
+                // poll just because the method contains a loop. Keep both sides
+                // of the actual header conservative for either emitted spelling.
+                if(loops.containsKey(current)) required.addAll(live);
                 for(int i = current.steps.size() - 1; i >= 0; --i) {
                     Step step = current.steps.get(i);
                     Set<Object> liveAfter = new HashSet<>(live);
@@ -850,11 +907,11 @@ final class ReadableMethodEmitter {
                     addReferenceUses(step.expression, live, byName);
                     if(step.expression.collects()) {
                         Set<Object> boundary = new HashSet<>(live);
-                        boundary.removeAll(handoffOperands(current, step, liveAfter));
+                        boundary.removeAll(handoffOperands(current, step, liveAfter, byName));
                         required.addAll(boundary);
                     }
                 }
-                if(!loops.isEmpty()) required.addAll(live);
+                if(loops.containsKey(current)) required.addAll(live);
                 if(!incoming.get(current).equals(live)) {
                     incoming.put(current, live);
                     changed = true;
@@ -869,6 +926,83 @@ final class ReadableMethodEmitter {
                 if(step.value != null && reference(step.value.type))
                     step.value.rootedReferences = required.contains(step.value.canonical());
         for(Value value : sharedValues) value.rootedReferences = required.contains(value.canonical());
+    }
+
+    /**
+     * Acyclic wrappers whose references die at protected calls need roots only
+     * for their own entry poll. Scalar work after the call does not extend a Java
+     * reference's lifetime. Nested argument evaluation and exception resumption
+     * remain conservative. The poll itself is retained, including recursive calls.
+     */
+    private boolean analyzeEntryOnlyRoots() {
+        if(!rootedReferences || boundedNormalReturn || !loops.isEmpty()
+                || instructions.size() > 512 || method.id().name().startsWith("<")
+                || !method.bytecode().tryCatchBlocks.isEmpty() || !monitorEntries.isEmpty()
+                || (method.bytecode().access & ACC_SYNCHRONIZED) != 0) return false;
+        Map<String, Local> byName = new HashMap<>();
+        for(Local local : locals.values()) byName.put(local.name, local);
+        Map<Block, Set<Object>> incoming = new IdentityHashMap<>();
+        for(Block current : blocks) incoming.put(current, new HashSet<>());
+        boolean changed, found = false;
+        do {
+            changed = false;
+            for(int index = blocks.size() - 1; index >= 0; --index) {
+                Block current = blocks.get(index);
+                Set<Object> live = new HashSet<>();
+                for(Block next : current.successors()) live.addAll(incoming.get(next));
+                for(int i = current.steps.size() - 1; i >= 0; --i) {
+                    Step step = current.steps.get(i);
+                    if(step.kind == Kind.STORE) live.remove(step.local);
+                    if(step.kind == Kind.LET || step.kind == Kind.EDGE) live.remove(step.value.canonical());
+                    if(step.expression.collects()) {
+                        if(!live.isEmpty() || protectedCalls(step.expression, byName) != 1) return false;
+                        found = true;
+                    }
+                    addReferenceUses(step.expression, live, byName);
+                }
+                if(!incoming.get(current).equals(live)) {
+                    incoming.put(current, live);
+                    changed = true;
+                }
+            }
+        } while(changed);
+        return found;
+    }
+
+    /** Returns -1 for an unprotected boundary or nested collecting argument. */
+    private int protectedCalls(Expr expression, Map<String, Local> byName) {
+        return protectedCalls(expression, byName, backend::protectsLastUseEntryCall, null);
+    }
+
+    private int protectedCalls(Expr expression, Map<String, Local> byName,
+                               Predicate<MethodInsnNode> protects, List<Expr> calls) {
+        int count = 0;
+        if(expression.collection) {
+            if(expression.generatedCall == null
+                    || !protects.test(expression.generatedCall)
+                    || expression.values.stream().anyMatch(value -> value.inline && value.expression.collects()))
+                return -1;
+            if(calls != null) calls.add(expression);
+            return 1;
+        }
+        // A sibling operand may be evaluated after the collecting dispatch in
+        // the same C++ expression. Only scalar siblings may remain unprotected.
+        if(expression.directLocal != null && reference(expression.directLocal.type)) return -1;
+        for(String name : expression.locals) {
+            Local local = byName.get(name);
+            if(local != null && reference(local.type)) return -1;
+        }
+        for(Value operand : expression.values) {
+            Value value = operand.canonical();
+            if(!value.inline) {
+                if(reference(value.type)) return -1;
+                continue;
+            }
+            int nested = protectedCalls(value.expression, byName, protects, calls);
+            if(nested < 0) return -1;
+            count += nested;
+        }
+        return count;
     }
 
     private void prepare() {
@@ -1071,9 +1205,13 @@ final class ReadableMethodEmitter {
             AbstractInsnNode instruction = instructions.get(i);
             sourceLine = lines.get(i);
             int opcode = instruction.getOpcode();
-            // Reuse ordinary Java loads only inside a straight-line region with no call,
-            // publication, class initialization, monitor or receiver reassignment.
-            if(instruction instanceof MethodInsnNode
+            // A resolved, bounded leaf may change primitive fields while preserving
+            // reference fields and array contents. It cannot publish or synchronize.
+            // Other calls remain barriers, as do class initialization and reassignment.
+            if(instruction instanceof MethodInsnNode call && backend.preservesReferenceReads(method.id(), call)) {
+                fieldReads.keySet().removeIf(read -> !reference(Type.getType(read.descriptor)));
+            }
+            else if(instruction instanceof MethodInsnNode
                     || instruction instanceof InvokeDynamicInsnNode
                     || opcode == NEW
                     || opcode == PUTSTATIC
@@ -1157,7 +1295,7 @@ final class ReadableMethodEmitter {
                 if(opcode >= ILOAD && opcode <= ALOAD) {
                     Value value =
                             value(
-                                    local.type,
+                                    opcode == ALOAD ? arrayTypes.getOrDefault(instruction, OBJECT) : local.type,
                                     local.name + "_value",
                                     new Expr(
                                             List.of(),
@@ -1169,6 +1307,7 @@ final class ReadableMethodEmitter {
                     value.expression.readIdentity =
                             localReadIdentities.computeIfAbsent(local, ignored -> new Object());
                     value.expression.confinedArray = confinedArrays.contains(instruction);
+                    value.expression.ordinaryArray = ordinaryArrays.contains(instruction);
                     stack.add(value);
                 }
                 else if(opcode >= ISTORE && opcode <= ASTORE) {
@@ -1463,17 +1602,24 @@ final class ReadableMethodEmitter {
                                                 + ")",
                                 true));
                 stack.getLast().expression.confinedArray = confinedArrays.contains(instruction);
+                stack.getLast().expression.ordinaryArray = ordinaryArrays.contains(instruction);
                 continue;
             }
             if(opcode == ARRAYLENGTH) {
+                Value array = pop();
                 push(
                         Type.INT_TYPE,
                         "length",
                         expr(
-                                List.of(pop()),
-                                v -> "::jnative::array_length(" + v.getFirst() + ")",
+                                List.of(array),
+                                v -> {
+                                    ArrayViewKey key = cachedArrayView(array);
+                                    return arrayLengths.containsKey(key) ? arrayLengths.get(key)
+                                            : "::jnative::array_length(" + v.getFirst() + ")";
+                                },
                                 true)
                                 .withoutCollection());
+                stack.getLast().expression.arrayLength = true;
                 continue;
             }
             if(opcode >= IALOAD && opcode <= SALOAD || opcode >= IASTORE && opcode <= SASTORE) {
@@ -1651,6 +1797,7 @@ final class ReadableMethodEmitter {
         if(put && (isStatic || receiver.receiver)) expression.afterArguments = true;
         expression.withoutCollection();
         if(!put) expression.confinedArray = confinedArrays.contains(field);
+        if(!put) expression.ordinaryArray = ordinaryArrays.contains(field);
         if(finalInstance || finalStatic) {
             expression.invariantArray = invariantSource;
             expression.invariantArrayName = name;
@@ -2069,44 +2216,30 @@ final class ReadableMethodEmitter {
                 push(OBJECT, "object", Expr.text(expression, true));
             }
             case ANEWARRAY -> {
-                String descriptor = owner.startsWith("[") ? "[" + owner : "[L" + owner + ";";
                 push(
                         OBJECT,
                         "array",
                         expr(
                                 List.of(pop()),
-                                v ->
-                                        "::jnative::new_array("
-                                                + quote(descriptor)
-                                                + ", "
-                                                + v.getFirst()
-                                                + ")",
+                                v -> backend.referenceArrayAllocation(owner, v.getFirst()),
                                 true));
             }
-            case CHECKCAST -> push(
-                    OBJECT,
-                    "object",
-                    expr(
-                            List.of(pop()),
-                            v ->
-                                    "::jnative::check_cast("
-                                            + v.getFirst()
-                                            + ", "
-                                            + backend.typeCheckArgument(owner)
-                                            + ")",
-                            true).preservesReference());
-            case INSTANCEOF -> push(
-                    Type.INT_TYPE,
-                    "instance",
-                    expr(
-                            List.of(pop()),
-                            v ->
-                                    "::jnative::instance_of("
-                                            + v.getFirst()
-                                            + ", "
-                                            + backend.typeCheckArgument(owner)
-                                            + ")",
-                            true));
+            case CHECKCAST -> {
+                Expr cast = expr(List.of(pop()),
+                        v -> (backend.exactTypeCheck(owner) ? "::jnative::check_cast_exact("
+                                : "::jnative::check_cast(") + v.getFirst() + ", "
+                                + backend.typeCheckArgument(owner) + ")", true).preservesReference();
+                if(backend.exactTypeCheck(owner)) cast.withoutCollection();
+                push(OBJECT, "object", cast);
+            }
+            case INSTANCEOF -> {
+                Expr check = expr(List.of(pop()),
+                        v -> (backend.exactTypeCheck(owner) ? "::jnative::instance_of_exact("
+                                : "::jnative::instance_of(") + v.getFirst() + ", "
+                                + backend.typeCheckArgument(owner) + ")", true);
+                if(backend.exactTypeCheck(owner)) check.withoutCollection();
+                push(Type.INT_TYPE, "instance", check);
+            }
             default -> fail("type instruction has no structured lowering");
         }
     }
@@ -2116,6 +2249,7 @@ final class ReadableMethodEmitter {
         boolean confined = confinedArrays.contains(instruction);
         boolean put = opcode >= IASTORE;
         int kind = opcode - (put ? IASTORE : IALOAD);
+        boolean exactStore = opcode == AASTORE && backend.boundedReferenceStore(method.id(), instruction);
         Value value = put ? pop() : null, index = pop(), array = pop();
         ArrayRead reusable = new ArrayRead(kind, readIdentity(array), readIdentity(index));
         if(!put) {
@@ -2130,7 +2264,7 @@ final class ReadableMethodEmitter {
                     case 1 -> Type.LONG_TYPE;
                     case 2 -> Type.FLOAT_TYPE;
                     case 3 -> Type.DOUBLE_TYPE;
-                    case 4 -> OBJECT;
+                    case 4 -> put ? OBJECT : arrayTypes.getOrDefault(instruction, OBJECT);
                     default -> Type.INT_TYPE;
                 };
         String element =
@@ -2142,7 +2276,7 @@ final class ReadableMethodEmitter {
                 };
         String access =
                 kind == 4
-                        ? "reference_" + (put ? "set" : "get")
+                        ? "reference_" + (put ? exactStore ? "set_exact" : "set" : "get")
                         : kind == 5
                         ? "byte_" + (put ? "set" : "get")
                         : (confined ? "confined_array_" : "array_")
@@ -2182,14 +2316,14 @@ final class ReadableMethodEmitter {
             expression.arrayElement = element;
             expression.arrayStore = put;
         }
-        if(!put || kind != 4) expression.withoutCollection();
+        if(!put || kind != 4 || exactStore) expression.withoutCollection();
         if(put) {
             effect(expression);
             // The successful store has performed its null and bounds checks. Forward
             // only exact-width primitives: byte/boolean, char and short stores narrow
             // their input, and reference stores have a separate type/GC contract.
             // lower() clears prior reads before every possibly aliasing store and
-            // at calls, synchronization, local changes and control-flow boundaries.
+            // at unknown calls, synchronization, local changes and control-flow boundaries.
             if(kind >= 0 && kind <= 3) arrayReads.put(reusable, value);
         }
         else {
@@ -2530,12 +2664,14 @@ final class ReadableMethodEmitter {
         MethodInsnNode generatedCall;
         Function<List<String>, CppEmitter.GuardedPrimitiveCopy> guardedCopy;
         boolean confinedArray;
+        boolean ordinaryArray;
         boolean stableArrayReference;
         String invariantArray;
         String invariantArrayName;
         Local directLocal;
         Object readIdentity;
         String arrayElement;
+        boolean arrayLength;
         boolean arrayStore;
         Integer integerConstant;
         int integerOperation = -1;
@@ -2901,7 +3037,8 @@ final class ReadableMethodEmitter {
                 if(instruction instanceof FieldInsnNode field && opcode == GETSTATIC && field.desc.startsWith("[")
                         && invariantStaticArray(backend.fieldOwner(field.owner, field.name, field.desc),
                         field.name, field.desc)) continue;
-                if(opcode == JSR || opcode == RET || opcode == AASTORE) return false;
+                if(opcode == JSR || opcode == RET
+                        || opcode == AASTORE && !backend.boundedReferenceStore(method.id(), instruction)) return false;
                 if(opcode > RETURN
                         && opcode != GETFIELD
                         && opcode != PUTFIELD
@@ -3958,6 +4095,7 @@ final class ReadableMethodEmitter {
                             && header.steps.stream().allMatch(s -> s.kind == Kind.CONDITION)
                             && header.transfers.isEmpty();
             boolean invert = testAtHead && header.yes == loop.exit;
+            Map<ArrayViewKey, String> previousLengths = simple ? out.beginLoopLength(loop, indent) : null;
             boolean lazy = out.lazyLoop(loop);
             int rootCheckpoint = out.nextRootSlot;
             boolean coldCheckpoint = out.coldRootsActive;
@@ -3992,6 +4130,9 @@ final class ReadableMethodEmitter {
             if(scopedViews) {
                 out.endArrayViews(previousViews);
                 out.line(--indent, "}");
+            }
+            if(previousLengths != null) {
+                out.restoreArrayLengths(previousLengths);
             }
             out.reset();
         }
@@ -4051,6 +4192,7 @@ final class ReadableMethodEmitter {
             String hint,
             String element,
             boolean confined,
+            boolean ordinary,
             boolean stableReference,
             Value snapshot) {
         String source() {
@@ -4064,7 +4206,7 @@ final class ReadableMethodEmitter {
         String declaration() {
             return element.equals("::jnative::Object*") ? "const ::jnative::ReferenceArrayView "
                     : (confined ? "const ::jnative::ConfinedArrayView<" : "const ::jnative::PrimitiveArrayView<")
-                    + element + "> ";
+                    + element + (confined ? "" : ordinary ? ", false" : ", true") + "> ";
         }
     }
 
@@ -4077,6 +4219,7 @@ final class ReadableMethodEmitter {
                     canonical.expression.invariantArrayName,
                     element,
                     canonical.expression.confinedArray,
+                    canonical.expression.ordinaryArray,
                     canonical.expression.stableArrayReference,
                     null);
         if(!canonical.inline && !canonical.shared && canonical.expression != null)
@@ -4086,6 +4229,7 @@ final class ReadableMethodEmitter {
                     canonical.name,
                     element,
                     canonical.expression.confinedArray,
+                    canonical.expression.ordinaryArray,
                     false,
                     canonical);
         return canonical.inline
@@ -4097,9 +4241,16 @@ final class ReadableMethodEmitter {
                 canonical.expression.directLocal.name,
                 element,
                 canonical.expression.confinedArray,
+                canonical.expression.ordinaryArray,
                 true,
                 null)
                 : null;
+    }
+
+    private ArrayViewKey cachedArrayView(Value array) {
+        for(ArrayViewKey key : arrayViews.keySet())
+            if(key.equals(arrayViewKey(array, key.element))) return key;
+        return null;
     }
 
     private static void collectArrayViews(Expr expression, Set<ArrayViewKey> views) {
@@ -4395,6 +4546,22 @@ final class ReadableMethodEmitter {
 
         void enterCollectingBranch(Node node, int indent) {
             if((!scopedRejoiningRoots && !lazyRoots) || !collectingBranches.contains(node)) return;
+            if(entryOnlyRoots) {
+                // This arm hands its last live references to a protected call.
+                // Only the arm-entry poll needs a caller-side root publication.
+                String heap = name("branch_heap");
+                line(indent, "auto& " + heap + " = ::jnative::managed_heap();");
+                line(indent, "if (" + heap + ".collection_pending()) {");
+                if(nextRootSlot > 0) {
+                    String values = String.join(", ", rootNames.subList(0, nextRootSlot).stream()
+                            .map(name -> name + ".get()").toList());
+                    line(indent + 1, "::jnative::poll_with_roots(" + heap + ", " + values + ");");
+                }
+                else line(indent + 1, heap + ".poll_if_requested();");
+                line(indent, "}");
+                publishedBranches.add(node);
+                return;
+            }
             activateRoots(indent);
             publishedBranches.add(node);
             // Even a scalar-only arm must cooperate before a recursive call. Its
@@ -4497,10 +4664,7 @@ final class ReadableMethodEmitter {
                     line(indent, "{");
                     enterScope();
                     line(indent + 1,
-                            (region.array.confined
-                                    ? "const ::jnative::ConfinedArrayView<"
-                                    : "const ::jnative::PrimitiveArrayView<")
-                                    + region.array.element + "> " + view
+                            region.array.declaration() + view
                                     + "(" + region.array.source() + ");");
                     line(indent + 1, "if (" + view + ".covers("
                             + region.minimum + ", " + region.maximum + ")) {");
@@ -4568,6 +4732,39 @@ final class ReadableMethodEmitter {
                     ? array : null;
         }
 
+        Map<ArrayViewKey, String> beginLoopLength(Loop loop, int indent) {
+            // Only a pure counter followed by ARRAYLENGTH in the first head test.
+            // Evaluating here preserves zero-iteration outer loops and exception
+            // order. The existing view proof excludes reassigned array locals.
+            Expr condition = loop.header.condition.expression;
+            if(condition.comparisonOperator == null || condition.values.size() != 2) return null;
+            Value counter = condition.values.getFirst().canonical();
+            Value limit = condition.values.get(1).canonical();
+            if(!counter.inline || counter.expression.directLocal == null
+                    || !limit.inline || !limit.expression.arrayLength) return null;
+            Value array = limit.expression.values.getFirst().canonical();
+            if(!array.inline || array.expression.directLocal == null) return null;
+            ArrayViewKey key = cachedArrayView(array);
+            if(key == null || arrayLengths.containsKey(key)) return null;
+            Map<ArrayViewKey, String> previous = new LinkedHashMap<>(arrayLengths);
+            String length = name(key.hint + "_length");
+            location(indent, loop.header.condition.line);
+            line(indent, "const std::int32_t " + length + " = " + arrayViews.get(key) + ".length();");
+            arrayLengths.put(key, length);
+            return previous;
+        }
+
+        void restoreArrayLengths(Map<ArrayViewKey, String> previous) {
+            arrayLengths.clear();
+            arrayLengths.putAll(previous);
+        }
+
+        String cachedLength(Value value) {
+            Value canonical = value.canonical();
+            return canonical.inline && canonical.expression.arrayLength
+                    ? arrayLengths.get(cachedArrayView(canonical.expression.values.getFirst())) : null;
+        }
+
         LoopGuard rangeGuard(Loop loop, int indent, boolean invert) {
             if(arrayViews.isEmpty()) return null;
             boolean restrictedReferences = !boundedLoopBody(loop);
@@ -4586,20 +4783,23 @@ final class ReadableMethodEmitter {
             RangeState state = new RangeState();
             Affine counter = state.value(condition.values.get(0));
             Affine limit = state.value(condition.values.get(1));
+            String cachedLength = cachedLength(condition.values.get(1));
             if(counter == null
                     || counter.constant != 0
                     || counter.terms.size() != 1
                     || counter.terms.values().iterator().next() != 1L
-                    || limit == null) return null;
-            // The loop limit must be an int literal or one unchanged int local.
-            if(!limit.terms.isEmpty()
+                    || limit == null && cachedLength == null) return null;
+            // The limit is a literal, an unchanged int local or a stable array length.
+            if(limit != null && !limit.terms.isEmpty()
                     && (limit.constant != 0
                     || limit.terms.size() != 1
                     || limit.terms.values().iterator().next() != 1L)) return null;
             state = loopRanges(loop);
             if(state == null || !Long.valueOf(1).equals(state.stride(counter))) return null;
-            for(Local local : limit.terms.keySet())
-                if(state.locals.containsKey(local)) return null;
+            if(limit != null)
+                for(Local local : limit.terms.keySet())
+                    if(state.locals.containsKey(local)) return null;
+            String limitCode = limit != null ? limit.code() : "static_cast<std::int64_t>(" + cachedLength + ")";
             Map<ArrayViewKey, List<AccessRange>> ranges = new LinkedHashMap<>();
             Set<ArrayViewKey> rejected = new HashSet<>();
             for(AccessRange range : state.ranges) {
@@ -4616,13 +4816,27 @@ final class ReadableMethodEmitter {
             }
             ranges.keySet().removeAll(rejected);
             if(ranges.isEmpty()) return null;
+            if(comparison.equals("<") && cachedLength != null && ranges.size() == 1) {
+                ArrayViewKey limitArray = cachedArrayView(
+                        condition.values.get(1).canonical().expression.values.getFirst());
+                List<AccessRange> accesses = ranges.get(limitArray);
+                if(accesses != null && accesses.stream()
+                        .allMatch(range -> range.mask == null && range.index.equals(counter))) {
+                    // i < this array's immutable length already proves the upper
+                    // bound and representable final counter. Only a negative start
+                    // needs checked access; empty loops need no separate range case.
+                    // A constant nonnegative start lets C++ remove the fallback.
+                    Local induction = counter.terms.keySet().iterator().next();
+                    return new LoopGuard(induction.read() + " >= 0", ranges.keySet(), induction, limitCode);
+                }
+            }
             String count = name("range_iterations");
             line(
                     indent,
                     "const std::int64_t "
                             + count
                             + " = "
-                            + limit.code()
+                            + limitCode
                             + " - "
                             + counter.code()
                             + (comparison.equals("<=") ? " + 1LL" : "")
@@ -4677,7 +4891,7 @@ final class ReadableMethodEmitter {
             for(int i = 0; i < guards.size(); i++)
                 line(indent + 1, guards.get(i) + (i + 1 == guards.size() ? ";" : " &&"));
             return new LoopGuard(valid, ranges.keySet(), counter.terms.keySet().iterator().next(),
-                    limit.code() + (comparison.equals("<=") ? " + 1LL" : ""));
+                    limitCode + (comparison.equals("<=") ? " + 1LL" : ""));
         }
 
         void beginParameterArrayViews(int indent) {

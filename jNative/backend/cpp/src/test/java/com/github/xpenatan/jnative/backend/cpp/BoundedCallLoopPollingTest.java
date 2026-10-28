@@ -285,7 +285,7 @@ class BoundedCallLoopPollingTest {
 
     @Test void guardsImmutableReferencesWhilePreservingPayloadMutationsAndRowReloads() throws Exception {
         String cpp = new CppEmitter().emit(fixture(), request).get("classes/PollCalls.cpp");
-        for(String name : List.of("aliasMutation", "finalMutation", "rowReplacement", "maskedIndex")) {
+        for(String name : List.of("aliasMutation", "finalMutation", "rowReplacement", "directRowReplacement", "maskedIndex")) {
             String body = body(cpp, "PollCalls", name);
             assertTrue(body.contains("chunk_end"), body);
             assertTrue(body.contains("get_unchecked("), body);
@@ -298,13 +298,20 @@ class BoundedCallLoopPollingTest {
         assertTrue(rows.contains("rows_elements.get_unchecked("), rows);
         assertTrue(rows.contains("::jnative::array_get<"), rows);
         assertFalse(rows.contains("ReferenceArrayView replacement_elements"), rows);
+        String direct = body(cpp, "PollCalls", "directRowReplacement");
+        assertTrue(body(cpp, "PollCalls", "replaceRow").contains("reference_set_exact("));
+        assertTrue(direct.contains("++ & 63u"), direct);
+        assertTrue(direct.indexOf("rows_elements.get_unchecked(")
+                > direct.indexOf("PollCalls::initialized_replaceRow("), direct);
+        assertTrue(direct.contains("::jnative::array_get<"), direct);
+        assertFalse(direct.contains("PrimitiveArrayView"), direct); // only the outer array is stable
         String masked = body(cpp, "PollCalls", "maskedIndex");
         assertTrue(masked.contains(".covers(0LL, 3LL)"), masked);
     }
 
     @Test void rejectsMutableReferencesCallDerivedIndicesAndChangingLoopLimits() throws Exception {
         String cpp = new CppEmitter().emit(fixture(), request).get("classes/PollCalls.cpp");
-        for(String name : List.of("mutableReplacement", "directRowReplacement", "unknownIndex", "changedLimit")) {
+        for(String name : List.of("mutableReplacement", "unknownIndex", "changedLimit")) {
             String body = body(cpp, "PollCalls", name);
             assertFalse(body.contains("get_unchecked("), body);
             assertFalse(body.contains("chunk_end"), body);
@@ -312,7 +319,6 @@ class BoundedCallLoopPollingTest {
         String replacement = body(cpp, "PollCalls", "mutableReplacement");
         assertTrue(replacement.contains("PollCalls::initialized_replace("), replacement);
         assertTrue(replacement.contains("++ & 63u"), replacement);
-        assertFalse(body(cpp, "PollCalls", "directRowReplacement").contains("poll_budget"));
     }
 
     private static MethodInsnNode firstCall(Program program, MethodId id) {

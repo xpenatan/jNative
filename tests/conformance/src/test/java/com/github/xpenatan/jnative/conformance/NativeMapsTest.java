@@ -35,12 +35,25 @@ class NativeMapsTest {
         Path generated = generation.request().generatedSourcesDirectory();
         String hash = Files.readString(generated.resolve("classes/java.util.HashMap.cpp"));
         String tree = Files.readString(generated.resolve("classes/java.util.TreeMap.cpp"));
-        for(String helper : List.of("hashmap_capacity", "hashmap_find", "hashmap_put", "hashmap_remove", "hashmap_clear"))
+        for(String helper : List.of("hashmap_capacity", "hashmap_lookup", "hashmap_put", "hashmap_remove", "hashmap_clear"))
             assertTrue(hash.contains("::jnative::" + helper + "("), helper);
         for(String helper : List.of("treemap_find", "treemap_put", "treemap_remove", "treemap_higher", "treemap_extreme", "treemap_clear"))
             assertTrue(tree.contains("::jnative::" + helper + "("), helper);
-        assertTrue(hash.contains("NativeFieldAccess<"));
-        assertTrue(tree.contains("NativeFieldAccess<"));
+        assertTrue(hash.contains("BoundNativeFieldAccess<"));
+        assertTrue(hash.contains("HashMap::lookup("), hash);
+        assertTrue(hash.contains("make_runtime_callback("), hash);
+        assertTrue(hash.contains("case ::generated::NativeMaps_FlatKey::class_id:"), hash);
+        assertTrue(hash.contains("case ::generated::NativeMaps_CollectingEquality::class_id:"), hash);
+        assertTrue(hash.contains("case ::generated::NativeMaps_9::class_id:"), hash);
+        assertFalse(hash.contains("case ::generated::NativeMaps_HashProbe::class_id:"), hash);
+        int inherited = hash.indexOf("case ::generated::NativeMaps_InheritedIdentity::class_id:");
+        assertTrue(inherited >= 0, hash);
+        assertTrue(hash.startsWith("return ::jnative::try_object_hash", hash.indexOf("return ", inherited)), hash);
+        assertTrue(hash.contains("default: return receiver->type_id() == 0 && ::jnative::try_object_hash"), hash);
+        assertFalse(hash.contains("::jnative::hashmap_find("), hash);
+        assertTrue(tree.contains("BoundNativeFieldAccess<"));
+        assertFalse(hash.contains("+[]"), hash);
+        assertFalse(tree.contains("+[]"), tree);
         assertFalse(hash.contains("advanceBucket"));
         var result = builder.compile(generation);
         assertEquals(expected, ProcessHarness.run(temporary, List.of(result.executable().toString()),

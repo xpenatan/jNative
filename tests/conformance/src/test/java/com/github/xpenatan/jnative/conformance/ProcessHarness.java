@@ -203,18 +203,7 @@ final class ProcessHarness {
         Assertions.assertEquals(0, built.exitCode(), built.text());
         // Merge inside Linux: WSL's stdout/stderr can have independent file offsets.
         // Transport argv as data to avoid two layers of Windows/WSL shell quoting.
-        Path runner = directory.resolve("linux-run.py"), data = directory.resolve("linux-argv.txt");
-        Files.writeString(
-                runner,
-                """
-                        import base64, os, sys
-                        from pathlib import Path
-                        values = [base64.b64decode(v).decode('utf-8') for v in Path(sys.argv[1]).read_bytes().splitlines()]
-                        os.environ['JNATIVE_GC_INTERVAL'] = values[0]
-                        os.environ['ASAN_OPTIONS'] = 'detect_leaks=1'
-                        os.dup2(1, 2)
-                        os.execv(values[1], values[1:])
-                        """);
+        Path data = directory.resolve("linux-argv.txt");
         var values =
                 new ArrayList<>(
                         List.of(Integer.toString(collectionInterval), build + "/" + target));
@@ -243,8 +232,19 @@ final class ProcessHarness {
                                 "-d",
                                 "Ubuntu",
                                 "--exec",
-                                "python3",
-                                folder + "/linux-run.py",
+                                "bash",
+                                "-c",
+                                """
+                                        values=()
+                                        while IFS= read -r line; do
+                                            value=$(printf '%s' "$line" | base64 --decode; printf '.')
+                                            values+=("${value%.}")
+                                        done < "$1"
+                                        export JNATIVE_GC_INTERVAL="${values[0]}"
+                                        export ASAN_OPTIONS=detect_leaks=1
+                                        exec "${values[@]:1}" 2>&1
+                                        """,
+                                "jnative-linux-run",
                                 folder + "/linux-argv.txt"),
                         Duration.ofSeconds(60));
         Assertions.assertEquals(expected, actual);

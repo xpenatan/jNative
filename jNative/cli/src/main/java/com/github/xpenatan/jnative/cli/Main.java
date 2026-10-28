@@ -43,7 +43,7 @@ public final class Main {
                             jnative export --project <generated-project> --destination <new-directory>
                             jnative archive --project <native-project> --destination <private-store> [--release]
                             jnative decode --report <report.json> --symbols <private-store> [--symbolizer <addr2line>] [--format text|json]
-                              [--from-dump | --core <core-file> --gdb <gdb>]
+                              [--from-dump]
                             jnative extract-sources --symbols <build-bundle> --destination <new-directory>
                             jnative reports --directory <report-directory>
                             jnative export-report --report <report.json> --destination <new-directory> [--without-dump]

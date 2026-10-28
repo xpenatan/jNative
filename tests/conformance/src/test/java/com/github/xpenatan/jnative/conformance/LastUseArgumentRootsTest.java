@@ -109,7 +109,12 @@ class LastUseArgumentRootsTest {
         assertTrue(body(cpp, "liveAfter").contains("FrameRoot<> a("), body(cpp, "liveAfter"));
         assertTrue(body(cpp, "liveAlias").contains("FrameRoot<> object("), body(cpp, "liveAlias"));
         assertTrue(body(cpp, "liveAlias").contains("FrameRoot<> alias("), body(cpp, "liveAlias"));
-        assertTrue(body(cpp, "rejectedRow").contains("FrameRoot<> element("), body(cpp, "rejectedRow"));
+        // A proven null store may detach the row, so the selected callee must
+        // retain it before its collecting arm. The caller's last use can hand off.
+        String detached = body(cpp, "initialized_detachedRow");
+        assertTrue(detached.contains("a.address(), rows.address()"), detached);
+        assertTrue(detached.indexOf("a.address()") < detached.indexOf("::jnative::safepoint()"), detached);
+        assertTrue(body(cpp, "rejectedRow").contains("::initialized_detachedRow(element, rows.get()"), cpp);
         assertTrue(body(cpp, "nativeCall").contains("FrameRoot<> array"), body(cpp, "nativeCall"));
         assertTrue(body(cpp, "fallbackCall").contains("FrameRoot<> array("), body(cpp, "fallbackCall"));
         assertTrue(cpp.contains("// Low-level fallback:"), cpp);

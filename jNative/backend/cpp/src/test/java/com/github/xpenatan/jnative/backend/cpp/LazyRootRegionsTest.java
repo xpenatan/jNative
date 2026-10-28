@@ -26,6 +26,7 @@ class LazyRootRegionsTest {
         Path source = directory.resolve("LazyRegions.java");
         Files.writeString(source, """
                 public class LazyRegions {
+                    static int initializationMarker = 1;
                     static int loops(int[] values, int count, boolean cold) {
                         if (cold) System.gc();
                         int i = 0;

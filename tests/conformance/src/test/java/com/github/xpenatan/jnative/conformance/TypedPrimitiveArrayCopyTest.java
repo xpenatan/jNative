@@ -39,7 +39,16 @@ class TypedPrimitiveArrayCopyTest {
         StringBuilder calls = new StringBuilder();
         for (int kind = 0; kind < types.size(); kind++) {
             String type = types.get(kind);
+            String different = type.equals("float")
+                    ? "Float.floatToRawIntBits(actual[i]) != Float.floatToRawIntBits(expected[i])"
+                    : type.equals("double")
+                            ? "Double.doubleToRawLongBits(actual[i]) != Double.doubleToRawLongBits(expected[i])"
+                            : "actual[i] != expected[i]";
             methods.append("""
+                    static void verify%1$s(%1$s[] actual, %1$s[] expected) {
+                        for (int i = 0; i < actual.length; i++)
+                            if (%3$s) throw new IllegalStateException("chunk value");
+                    }
                     static String copy%1$s(%1$s[] source, int from, %1$s[] target, int to, int count) {
                         try {
                             System.arraycopy(source, from, target, to, count);
@@ -71,16 +80,53 @@ class TypedPrimitiveArrayCopyTest {
                         System.out.println(copy%1$s(shared, Integer.MAX_VALUE, shared, 0, 0));
                         System.out.println(copy%1$s(shared, 0, shared, Integer.MIN_VALUE, 0));
                         System.gc(); System.out.println(snapshot(shared));
+                        for (int count : new int[]{65, 1023, 1024, 1025, 2049}) {
+                            for (int shift : new int[]{1, 7, 1023, 1024, 1025}) {
+                                %1$s[] actual = new %1$s[count + shift + 1];
+                                %1$s[] expected = new %1$s[actual.length];
+                                for (int i = 0; i < actual.length; i++) actual[i] = expected[i] = %2$s;
+                                for (int i = count - 1; i >= 0; i--) expected[shift + i] = expected[i];
+                                if (!copy%1$s(actual, 0, actual, shift, count).equals("copied"))
+                                    throw new IllegalStateException("backward chunk");
+                                verify%1$s(actual, expected);
+                                System.gc();
+                                for (int i = 0; i < count; i++) expected[i] = expected[shift + i];
+                                if (!copy%1$s(actual, shift, actual, 0, count).equals("copied"))
+                                    throw new IllegalStateException("forward chunk");
+                                verify%1$s(actual, expected);
+                            }
+                        }
+                        System.out.println("%1$s chunks verified");
                     }
-                    """.formatted(type, seeds.get(kind)));
+                    static String row%1$s(%1$s[][] source, int row, %1$s[][] target, int count) {
+                        try {
+                            System.arraycopy(source[row], 0, target[0], 1, count);
+                            return "copied";
+                        } catch (RuntimeException error) { return error.getClass().getName(); }
+                    }
+                    static void rows%1$s() {
+                        %1$s[] values = new %1$s[70];
+                        for (int i = 0; i < values.length; i++) values[i] = %2$s;
+                        %1$s[][] rows = {values, null};
+                        for (int count : COUNTS) {
+                            System.out.println(row%1$s(rows, 0, rows, count));
+                            System.gc(); System.out.println(snapshot(values));
+                        }
+                        System.out.println(row%1$s(null, 0, null, 0));
+                        System.out.println(row%1$s(rows, 1, rows, 0));
+                        System.out.println(row%1$s(rows, -1, null, 0));
+                        System.out.println(row%1$s(rows, 0, new %1$s[][]{null}, 0));
+                    }
+                    """.formatted(type, seeds.get(kind), different));
             calls.append("run").append(type).append("();\n");
+            calls.append("rows").append(type).append("();\n");
         }
         Path source = temporary.resolve("TypedCopies.java");
         Path classes = temporary.resolve("classes");
         Files.writeString(source, """
                 import java.util.Arrays;
                 public class TypedCopies {
-                    static final int[] COUNTS = {0, 1, 20, 64, 65, -1, Integer.MIN_VALUE, Integer.MAX_VALUE};
+                    static final int[] COUNTS = {0, 1, 7, 8, 9, 15, 16, 17, 20, 31, 32, 33, 63, 64, 65, -1, Integer.MIN_VALUE, Integer.MAX_VALUE};
                     static int events;
                     static String snapshot(Object array) {
                         if (array instanceof boolean[] values) return Arrays.toString(values);
@@ -122,6 +168,25 @@ class TypedPrimitiveArrayCopyTest {
                     static void merged(int[] integers, float[] floats, boolean choose, int count) {
                         System.arraycopy(choose ? integers : floats, 0, choose ? integers : floats, 1, count);
                     }
+                    static String localRows(Object source, Object target, boolean choose, int count) {
+                        try {
+                            int[][] rows = choose ? (int[][]) source : null;
+                            int[] destination = (int[]) target;
+                            System.arraycopy(rows[0], 0, destination, 1, count);
+                            return "copied";
+                        } catch (RuntimeException error) { return error.getClass().getName(); }
+                    }
+                    static String mixedRows(int[][] integers, float[][] floats, boolean choose, Object target) {
+                        try {
+                            Object[] rows = choose ? integers : floats;
+                            System.arraycopy(rows[0], 0, target, 0, 3);
+                            return "copied";
+                        } catch (RuntimeException error) { return error.getClass().getName(); }
+                    }
+                    static void elementEffects(int[][][] source, int count) {
+                        events = 0;
+                        System.arraycopy(source[0][0], index(0, 2), source[1][0], index(1, 4), count(count));
+                    }
                     static void literal(int[] source, int[] target) {
                         System.arraycopy(source, 0, target, 0, 64);
                     }
@@ -140,6 +205,14 @@ class TypedPrimitiveArrayCopyTest {
                         %s
                         int[] integers = {1, 2, 3, 4};
                         float[] floats = {5, 6, 7, 8};
+                        System.out.println(localRows(new int[][]{integers}, integers, true, 3));
+                        System.out.println(localRows(new int[][]{integers}, integers, false, 0));
+                        System.out.println(localRows(new float[][]{floats}, integers, true, 0));
+                        System.out.println(mixedRows(new int[][]{integers}, new float[][]{floats}, true, integers));
+                        System.out.println(mixedRows(new int[][]{integers}, new float[][]{floats}, false, floats));
+                        System.out.println(mixedRows(new int[][]{integers}, new float[][]{floats}, false, integers));
+                        elementEffects(new int[][][]{{integers}, {integers}}, 3);
+                        System.out.println(events); System.out.println(snapshot(integers));
                         merged(integers, floats, true, 3);
                         merged(integers, floats, false, 3);
                         System.out.println(snapshot(integers)); System.out.println(snapshot(floats));
@@ -187,14 +260,18 @@ class TypedPrimitiveArrayCopyTest {
             assertTrue(body.contains("::jnative::bounded_primitive_array_copy<" + nativeTypes.get(kind) + ">("), body);
             assertTrue(body.contains("<= 64"), body);
             assertTrue(body.contains("gc_roots"), body);
+            String row = body(cpp, "row" + types.get(kind));
+            assertTrue(row.contains("::jnative::bounded_primitive_array_copy<" + nativeTypes.get(kind) + ">("), row);
         }
-        for (String method : List.of("objectCopy", "referenceCopy", "nestedCopy", "mismatched", "merged")) {
+        for (String method : List.of("objectCopy", "referenceCopy", "nestedCopy", "mismatched", "merged", "mixedRows")) {
             String body = body(cpp, method);
             assertFalse(body.contains("bounded_primitive_array_copy"), body);
             assertTrue(body.contains("platform_System_arraycopy_7b15f0890b"), body);
         }
         assertTrue(body(cpp, "literal").contains("::jnative::bounded_primitive_array_copy<std::int32_t>("), cpp);
         assertTrue(body(cpp, "effectful").contains("::jnative::bounded_primitive_array_copy<std::int32_t>("), cpp);
+        assertTrue(body(cpp, "localRows").contains("::jnative::bounded_primitive_array_copy<std::int32_t>("), cpp);
+        assertTrue(body(cpp, "elementEffects").contains("::jnative::bounded_primitive_array_copy<std::int32_t>("), cpp);
         var result = builder.compile(generation);
         assertEquals(expected, ProcessHarness.run(temporary, List.of(result.executable().toString()),
                 Duration.ofSeconds(60), Map.of("JNATIVE_GC_INTERVAL", "1")));

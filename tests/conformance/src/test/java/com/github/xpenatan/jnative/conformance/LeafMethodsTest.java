@@ -28,6 +28,7 @@ class LeafMethodsTest {
                 """
                         import java.nio.ByteBuffer;
                         public class Leaves {
+                            static int initializationMarker = 1;
                             Object value;
                             volatile int number;
                             int[] numbers = {3, 5, 7};

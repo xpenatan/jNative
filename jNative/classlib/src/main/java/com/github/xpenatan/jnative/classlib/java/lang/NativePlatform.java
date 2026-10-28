@@ -8,7 +8,9 @@ import com.github.xpenatan.jnative.substitution.SubstituteMethod;
 @NativeInclude("jn_platform_bindings.hpp")
 public final class NativePlatform {
     private NativePlatform() {}
-    @NativeImport(value = "jnative::platform_IOException_initialize_c2f18a8416", managed = true, runtimeOnly = true, instance = true,
+    // These no-argument runtime initializers are empty; native object construction
+    // has already initialized their storage. Keep allocating/callback constructors separate.
+    @NativeImport(value = "jnative::platform_IOException_initialize_c2f18a8416", managed = true, runtimeOnly = true, boundedAccess = true, instance = true,
             targets = {"java/io/IOException.<init>()V",
                     "java/lang/AbstractMethodError.<init>()V",
                     "java/lang/ArithmeticException.<init>()V",
@@ -906,6 +908,7 @@ public final class NativePlatform {
 
     @SubstituteMethod(owner = "java.lang.Object", name = "hashCode", descriptor = "()I")
     @NativeImport(value = "jnative::platform_Object_hashCode_339f483e8c", managed = true, managesRoots = true, runtimeOnly = true, instance = true,
+            boundedAttempt = "jnative::try_object_hash",
             targets = {"java/lang/Object.hashCode()I"})
     public static native int platform_Object_hashCode_339f483e8c(Object self);
 
@@ -1053,7 +1056,7 @@ public final class NativePlatform {
     public static native Object platform_String_valueOf_12e41bcdc0(boolean arg0);
 
     @SubstituteMethod(owner = "java.lang.System", name = "arraycopy", descriptor = "(Ljava/lang/Object;ILjava/lang/Object;II)V")
-    @NativeImport(value = "jnative::platform_System_arraycopy_7b15f0890b", managed = true, runtimeOnly = true, instance = false,
+    @NativeImport(value = "jnative::platform_System_arraycopy_7b15f0890b", managed = true, runtimeOnly = true, instance = false, borrowedArrays = {0, 2},
             targets = {"java/lang/System.arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V"})
     public static native void platform_System_arraycopy_7b15f0890b(Object arg0, int arg1, Object arg2, int arg3, int arg4);
 

@@ -11,6 +11,12 @@
 #include <cstdlib>
 
 namespace jnative {
+void invalid_managed_execution() {
+    throw std::logic_error("Safepoint outside managed execution");
+}
+void invalid_root_frame() {
+    throw std::logic_error("A root frame needs an attached managed thread");
+}
 namespace { RuntimeSubstitutions substitution_policy; }
 void configure_runtime_substitutions(const RuntimeSubstitutions& policy) { substitution_policy = policy; }
 const RuntimeSubstitutions& runtime_substitutions() { return substitution_policy; }
@@ -90,12 +96,6 @@ void print_stack_trace(Object* object, Object* stream) {
 #endif
 }
 
-void Tracer::visit(Object* object) {
-    if (object && !object->marked) {
-        object->marked = true;
-        work_.push_back(object);
-    }
-}
 void Tracer::drain() {
     while (!work_.empty()) {
         auto object = work_.back();
@@ -109,13 +109,26 @@ Heap::Heap() {
     const char* value = std::getenv("JNATIVE_STATS");
     measure_ = value && std::string(value) == "1";
 }
-Heap::~Heap() { for (auto object : objects_) delete object; }
+Heap::~Heap() {
+    for (auto object : objects_) delete object;
+    for (auto& arena : arenas_) arena->sweep(true);
+}
 
 void Heap::attach(ThreadContext* thread) {
     std::unique_lock<::jnative::platform::Mutex> lock(mutex_);
     if (closed_) throw std::logic_error("Runtime has shut down");
     changed_.wait(lock, [&] { return !collecting_; });
+    ManagedArena* arena = nullptr;
+    for (auto& candidate : arenas_) {
+        if (!candidate->attached) { arena = candidate.get(); break; }
+    }
+    if (!arena) {
+        arenas_.push_back(make_owned<ManagedArena>(this));
+        arena = arenas_.back().get();
+    }
     threads_.push_back(thread);
+    arena->attached = true;
+    thread->arena = arena;
     thread->heap = this;
     platform::managed_context() = thread;
 }
@@ -123,6 +136,9 @@ void Heap::detach(ThreadContext* thread) {
     std::lock_guard<::jnative::platform::Mutex> lock(mutex_);
     if (thread->roots || thread->root_frames || thread->root_addresses) std::terminate();
     flush_allocations(thread);
+    thread->arena->trim(0);
+    thread->arena->attached = false;
+    thread->arena = nullptr;
     for (BorrowedBlock* block : thread->borrowed_blocks)
         available_borrowed_blocks_.push_back(block);
     threads_.erase(std::remove(threads_.begin(), threads_.end(), thread), threads_.end());
@@ -155,7 +171,8 @@ void Heap::poll() {
     park(lock);
 }
 void Heap::collect() {
-    if (!current_thread() || current_thread()->state != ThreadState::running_managed)
+    if (!current_thread() || current_thread()->heap != this
+            || current_thread()->state != ThreadState::running_managed)
         throw std::logic_error("Collection outside managed execution");
     std::unique_lock<::jnative::platform::Mutex> lock(mutex_);
     if (collecting_) { park(lock); return; }
@@ -169,8 +186,9 @@ void Heap::collect() {
         });
     });
     try {
-        for (auto thread : threads_) flush_allocations(thread);
-        Tracer tracer;
+        peak_objects_ = std::max(peak_objects_, object_count());
+        peak_managed_bytes_ = std::max(peak_managed_bytes_, managed_bytes());
+        auto& tracer = tracer_;
         for (auto thread : threads_) {
             for (auto root = thread->roots; root; root = root->previous)
                 tracer.visit(root->value);
@@ -185,21 +203,78 @@ void Heap::collect() {
         for (auto entry : handles_) tracer.visit(entry.second);
         for (auto field : static_roots_) tracer.visit(field->get());
         tracer.drain();
-        auto end = std::remove_if(objects_.begin(), objects_.end(), [](Object* object) {
-            if (object->marked) { object->marked = false; return false; }
+        // Reserve only for surviving queued objects. Until this succeeds, all
+        // objects still belong to their original lists/arenas and marking can unwind.
+        std::size_t survivors = 0;
+        for (auto thread : threads_)
+            for (auto object : thread->allocation_queue) survivors += object->marked;
+        if (survivors > objects_.max_size() - objects_.size()) throw std::bad_alloc();
+        if (objects_.size() + survivors > objects_.capacity())
+            objects_.reserve(std::max(objects_.size() + survivors,
+                    objects_.capacity() <= objects_.max_size() / 2 ? objects_.capacity() * 2 : objects_.max_size()));
+        collector_->sweeping = true;
+        std::size_t surviving_bytes = 0;
+        auto end = std::remove_if(objects_.begin(), objects_.end(), [&](Object* object) {
+            if (object->marked) {
+                surviving_bytes += managed_allocation_size(object);
+                object->marked = false;
+                return false;
+            }
             delete object;
             return true;
         });
         objects_.erase(end, objects_.end());
+        for (auto thread : threads_) {
+            auto& pending = thread->allocation_queue;
+            total_allocations_ += thread->queued_allocations.load(std::memory_order_relaxed);
+            total_allocated_bytes_ += thread->queued_bytes.load(std::memory_order_relaxed);
+            for (auto object : pending) {
+                if (object->marked) {
+                    surviving_bytes += managed_allocation_size(object);
+                    object->marked = false;
+                    objects_.push_back(object);
+                } else delete object;
+            }
+            pending.clear();
+            thread->queued_allocations.store(0, std::memory_order_relaxed);
+            thread->queued_bytes.store(0, std::memory_order_relaxed);
+            thread->reported_allocations = 0;
+            thread->reported_bytes = 0;
+        }
+        retained_objects_ = objects_.size();
+        for (auto& arena : arenas_) {
+            auto live = arena->sweep();
+            retained_objects_ += live.first;
+            surviving_bytes += live.second;
+        }
+        retained_bytes_ = surviving_bytes;
+        // Reuse the default allocation working set after a sweep, including
+        // medium array pages. Bound the heap's total empty-page cache to 8 MiB,
+        // divided among attached mutators; detached arenas retain none.
+        const auto warm_bytes_per_arena = (8 * 1024 * 1024) / threads_.size();
+        for (auto& arena : arenas_) arena->trim(arena->attached ? warm_bytes_per_arena : 0);
+        collector_->sweeping = false;
         ++collections_;
         allocations_.store(0, std::memory_order_relaxed);
+        allocation_bytes_.store(0, std::memory_order_relaxed);
         // Keep collection work proportional to allocations as the live application grows.
-        if (adaptive_threshold_)
-            threshold_.store(std::max<std::size_t>(4096, objects_.size()), std::memory_order_relaxed);
+        if (adaptive_threshold_) {
+            // Amortize repeated tracing of surviving graphs over more new
+            // objects. The independent byte budget still bounds allocation
+            // headroom; explicit object-count intervals bypass this policy.
+            const auto scan_budget = std::min(retained_objects_, std::numeric_limits<std::size_t>::max() / 4) * 4;
+            threshold_.store(std::max<std::size_t>(4096, scan_budget), std::memory_order_relaxed);
+            byte_threshold_.store(std::max<std::size_t>(4 * 1024 * 1024, retained_bytes_), std::memory_order_relaxed);
+        }
         if (measure_) pauses_ns_.push_back(static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(platform::MonotonicClock::now() - start).count()));
     } catch (...) {
+        tracer_.clear();
         for (auto object : objects_) object->marked = false;
+        for (auto thread : threads_)
+            for (auto object : thread->allocation_queue) object->marked = false;
+        for (auto& arena : arenas_) arena->clear_marks();
+        collector_->sweeping = false;
         collecting_ = false;
         collector_ = nullptr;
         collection_requested_.store(false, std::memory_order_seq_cst);
@@ -212,30 +287,45 @@ void Heap::collect() {
     changed_.notify_all();
 }
 void Heap::before_allocation() {
-    poll();
-    if (allocations_.load(std::memory_order_relaxed) >= threshold_.load(std::memory_order_relaxed))
-        collect();
+    auto thread = current_thread();
+    if (!thread || thread->heap != this || thread->state != ThreadState::running_managed)
+        throw std::logic_error("Safepoint outside managed execution");
+    before_allocation(thread);
 }
 void Heap::adopt(Object* object) {
     auto thread = current_thread();
     if (!thread || thread->heap != this || thread->state != ThreadState::running_managed)
         throw std::logic_error("Allocation outside managed execution");
-    thread->allocation_queue.push_back(object);
-    thread->queued_allocations.store(thread->allocation_queue.size(), std::memory_order_relaxed);
-    allocations_.fetch_add(1, std::memory_order_relaxed);
+    adopt(thread, object);
 }
 void Heap::flush_allocations(ThreadContext* thread) {
     auto& pending = thread->allocation_queue;
     objects_.insert(objects_.end(), pending.begin(), pending.end());
-    total_allocations_ += pending.size();
+    const auto count = thread->queued_allocations.load(std::memory_order_relaxed);
+    total_allocations_ += count;
+    retained_objects_ += count;
+    const auto bytes = thread->queued_bytes.load(std::memory_order_relaxed);
+    total_allocated_bytes_ += bytes;
+    retained_bytes_ += bytes;
+    allocations_.fetch_add(count - thread->reported_allocations, std::memory_order_relaxed);
+    allocation_bytes_.fetch_add(bytes - thread->reported_bytes, std::memory_order_relaxed);
+    thread->reported_allocations = 0;
+    thread->reported_bytes = 0;
     pending.clear();
     thread->queued_allocations.store(0, std::memory_order_relaxed);
+    thread->queued_bytes.store(0, std::memory_order_relaxed);
     peak_objects_ = std::max(peak_objects_, object_count());
+    peak_managed_bytes_ = std::max(peak_managed_bytes_, managed_bytes());
 }
 std::size_t Heap::object_count() const {
-    std::size_t result = objects_.size();
+    std::size_t result = retained_objects_;
     for (auto thread : threads_)
         result += thread->queued_allocations.load(std::memory_order_relaxed);
+    return result;
+}
+std::size_t Heap::managed_bytes() const {
+    std::size_t result = retained_bytes_;
+    for (auto thread : threads_) result += thread->queued_bytes.load(std::memory_order_relaxed);
     return result;
 }
 void Heap::enter_native(ThreadState state) {
@@ -343,17 +433,25 @@ void Heap::report_statistics() {
         return pauses.empty() ? std::uint64_t(0) : pauses[((pauses.size() - 1) * p + 99) / 100];
     };
     auto live_objects = object_count();
-    auto total_allocations = total_allocations_ + live_objects - objects_.size();
+    auto total_allocations = total_allocations_ + live_objects - retained_objects_;
     peak_objects_ = std::max(peak_objects_, live_objects);
+    const auto current_bytes = managed_bytes();
+    peak_managed_bytes_ = std::max(peak_managed_bytes_, current_bytes);
+    std::size_t pooled_bytes = 0;
+    for (auto& arena : arenas_) pooled_bytes += arena->reserved_bytes();
     platform::error_output() << "JNATIVE_STATS allocations=" << total_allocations << " live_objects=" << live_objects
         << " peak_objects=" << peak_objects_ << " collections=" << collections_
         << " gc_total_ns=" << total << " gc_p50_ns=" << percentile(50) << " gc_p99_ns=" << percentile(99)
-        << " gc_max_ns=" << percentile(100) << '\n';
+        << " gc_max_ns=" << percentile(100) << " pooled_bytes=" << pooled_bytes
+        << " allocated_bytes=" << total_allocated_bytes_ + current_bytes - retained_bytes_
+        << " managed_bytes=" << current_bytes << " peak_managed_bytes=" << peak_managed_bytes_ << '\n';
 }
 void Heap::collection_threshold(std::size_t threshold) {
     if (!threshold) throw std::invalid_argument("Collection threshold must be positive");
     std::lock_guard<::jnative::platform::Mutex> lock(mutex_);
     threshold_.store(threshold, std::memory_order_relaxed);
+    // Explicit intervals are deterministic stress/debug controls, not byte budgets.
+    byte_threshold_.store(std::numeric_limits<std::size_t>::max(), std::memory_order_relaxed);
     adaptive_threshold_ = false;
 }
 void Heap::add_static_root(ManagedField<Object*>* field) {
@@ -699,12 +797,16 @@ bool instance_of(Object* object, const char* expected) {
     if (actual == expected || std::strcmp(actual, expected) == 0) return true;
     return assignable_name(actual, expected);
 }
+void fail_cast(Object* object, const char* expected) {
+    std::string message = std::string(object->type_name()) + " cannot be cast to " + expected;
+    std::replace(message.begin(), message.end(), '/', '.');
+    raise("java/lang/ClassCastException", message.c_str());
+}
+void invalid_array_operation(const char* message) {
+    throw std::logic_error(message);
+}
 Object* check_cast(Object* object, const char* expected) {
-    if (object && !instance_of(object, expected)) {
-        std::string message = std::string(object->type_name()) + " cannot be cast to " + expected;
-        std::replace(message.begin(), message.end(), '/', '.');
-        raise("java/lang/ClassCastException", message.c_str());
-    }
+    if (object && !instance_of(object, expected)) fail_cast(object, expected);
     return object;
 }
 Thrown::Thrown(Object* object) : object_(object), description_(object->type_name()) {
@@ -787,12 +889,55 @@ void ClassInitialization::run_slow(const std::function<void()>& initializer) {
     state_ = 2;
     changed_.notify_all();
 }
-ReferenceArray::ReferenceArray(std::int32_t size, std::string type)
-    : Array(size, 'L'), descriptor(std::move(type)), elements(make_array<OrdinaryField<Object*> >(size)),
-      component_class_id([this] {
-          auto found = type_lookup().find(component(descriptor));
-          return found == type_lookup().end() ? 0 : found->second->generated_id;
-      }()), accepts_any_reference(descriptor == "[Ljava/lang/Object;") {}
+std::size_t ReferenceArray::allocation_size(std::size_t count, std::size_t name_size) {
+    static_assert(alignof(ReferenceArray) <= alignof(std::max_align_t), "Array needs fundamental alignment");
+    static_assert(alignof(Field) <= alignof(std::max_align_t), "Payload needs fundamental alignment");
+    const auto maximum = std::numeric_limits<std::size_t>::max();
+    if (count > static_cast<std::size_t>(INT32_MAX) || name_size >= maximum - payload_offset())
+        throw std::bad_array_new_length();
+    const auto header_and_name = payload_offset() + name_size + 1;
+    if (count > (maximum - header_and_name) / sizeof(Field)) throw std::bad_array_new_length();
+    return header_and_name + count * sizeof(Field);
+}
+void* ReferenceArray::operator new(std::size_t bytes, std::int32_t count, std::size_t name_size, ManagedArena* arena) {
+    if (bytes != sizeof(ReferenceArray) || count < 0) throw std::bad_array_new_length();
+    return managed_allocate_dynamic(allocation_size(static_cast<std::size_t>(count), name_size), arena);
+}
+char* ReferenceArray::construct_descriptor(ReferenceArray* shell, std::int32_t count, const char* type, std::size_t size) {
+    void* tail = reinterpret_cast<unsigned char*>(shell) + payload_offset() + static_cast<std::size_t>(count) * sizeof(Field);
+    auto* name = ::new (tail) char[size + 1];
+    std::memcpy(name, type, size + 1);
+    return name;
+}
+ReferenceArray::Field* ReferenceArray::construct_payload(ReferenceArray* shell, std::int32_t count) {
+    static_assert(std::is_nothrow_default_constructible<Field>::value, "Reference initialization must not throw");
+    static_assert(std::is_trivially_destructible<Field>::value, "Constructor failure must not leave nontrivial payloads");
+    void* tail = reinterpret_cast<unsigned char*>(shell) + payload_offset();
+    // Field's default member initializer constructs a null atomic reference.
+    // Avoid the additional whole-array zero pass from value initialization.
+    return ::new (tail) Field[static_cast<std::size_t>(count)];
+}
+ReferenceArray* ReferenceArray::create(std::int32_t count, const char* type) {
+    if (count < 0) raise("java/lang/NegativeArraySizeException");
+    const auto found = type_lookup().find(component(type));
+    return create(count, type, found == type_lookup().end() ? 0 : found->second->generated_id);
+}
+ReferenceArray* ReferenceArray::create(std::int32_t count, const char* type, std::uint32_t component_id) {
+    if (count < 0) raise("java/lang/NegativeArraySizeException");
+    const auto name_size = std::strlen(type);
+    auto thread = managed_thread();
+    auto& heap = *thread->heap;
+    heap.before_allocation(thread);
+    std::unique_ptr<ReferenceArray> object(new (count, name_size, thread->arena) ReferenceArray(count, type, name_size, component_id));
+    heap.adopt(thread, object.get());
+    return object.release();
+}
+ReferenceArray::ReferenceArray(std::int32_t size, const char* type, std::size_t name_size, std::uint32_t component_id)
+    : Array(size, 'L'), descriptor(construct_descriptor(this, size, type, name_size)), elements(construct_payload(this, size)),
+      component_class_id(component_id), accepts_any_reference(std::strcmp(descriptor, "[Ljava/lang/Object;") == 0) {}
+ReferenceArray::~ReferenceArray() {
+    for (std::int32_t i = length; i > 0; --i) elements[i - 1].~Field();
+}
 void ReferenceArray::trace(Tracer& tracer) {
     for (std::int32_t i = 0; i < length; ++i) tracer.visit(elements[i].get());
 }
@@ -807,7 +952,7 @@ Object* new_array(const char* descriptor, std::int32_t length) {
         case 'J': return PrimitiveArray<std::int64_t>::create(length, descriptor);
         case 'F': return PrimitiveArray<float>::create(length, descriptor);
         case 'D': return PrimitiveArray<double>::create(length, descriptor);
-        default: return allocate<ReferenceArray>(length, descriptor);
+        default: return ReferenceArray::create(length, descriptor);
     }
 }
 Object* multi_array(const char* descriptor, const std::vector<std::int32_t>& dimensions, std::size_t depth) {
@@ -821,22 +966,16 @@ Object* multi_array(const char* descriptor, const std::vector<std::int32_t>& dim
     }
     return array.get();
 }
-void reference_set(Object* object, std::int32_t index, Object* value) {
-    auto array = reference_array(object);
-    array->bounds(index);
-    if (value && !array->accepts_any_reference) {
-        // The component is immutable. Generated objects can use the same
-        // hierarchy bitmap as casts, without parsing or hashing a class name
-        // on every store. Runtime objects and nested arrays keep Java covariance.
-        const auto actual = value->type_id();
-        const auto expected = array->component_class_id;
-        const bool known = actual && expected && actual <= generated_type_checks.classes
-            && expected <= generated_type_checks.classes;
-        const bool accepted = known ? generated_assignable(actual, expected)
-            : assignable_name(value->type_name(), component(array->descriptor));
-        if (!accepted) raise("java/lang/ArrayStoreException");
-    }
-    array->elements[index].set(value);
+void check_reference_store(ReferenceArray* array, Object* value) {
+    // Generated objects use the hierarchy bitmap without parsing or hashing
+    // class names. Runtime objects and nested arrays retain Java covariance.
+    const auto actual = value->type_id();
+    const auto expected = array->component_class_id;
+    const bool known = actual && expected && actual <= generated_type_checks.classes
+        && expected <= generated_type_checks.classes;
+    const bool accepted = known ? generated_assignable(actual, expected)
+        : assignable_name(value->type_name(), component(array->descriptor));
+    if (!accepted) raise("java/lang/ArrayStoreException");
 }
 std::int32_t byte_get(Object* object, std::int32_t index) {
     return require_non_null(object)->array_kind == 'Z' ? array_get<std::uint8_t>(object, index) : array_get<std::int8_t>(object, index);
@@ -1032,24 +1171,49 @@ bool string_equals(Object* object, Object* other) {
     }
     return true;
 }
+namespace {
+std::uint32_t hash_characters(const char16_t* text, std::size_t size, std::uint32_t hash) {
+    std::size_t i = 0;
+    if (size >= 32) {
+        // Independent lanes permit vectorization and avoid a multiply dependency
+        // per character. The scale carries a prior chunk's hash across all lanes.
+        std::uint32_t a = 0, b = 0, c = 0, d = 0, scale = 1;
+        for (; i + 4 <= size; i += 4) {
+            a = a * UINT32_C(923521) + static_cast<std::uint32_t>(text[i]);
+            b = b * UINT32_C(923521) + static_cast<std::uint32_t>(text[i + 1]);
+            c = c * UINT32_C(923521) + static_cast<std::uint32_t>(text[i + 2]);
+            d = d * UINT32_C(923521) + static_cast<std::uint32_t>(text[i + 3]);
+            scale *= UINT32_C(923521);
+        }
+        hash = hash * scale + a * UINT32_C(29791) + b * UINT32_C(961) + c * UINT32_C(31) + d;
+    }
+    // Expand four recurrence steps in unsigned arithmetic. Independent character
+    // products shorten the dependency chain without changing Java int overflow.
+    for (; i + 4 <= size; i += 4)
+        hash = hash * UINT32_C(923521) + static_cast<std::uint32_t>(text[i]) * UINT32_C(29791)
+            + static_cast<std::uint32_t>(text[i + 1]) * UINT32_C(961)
+            + static_cast<std::uint32_t>(text[i + 2]) * UINT32_C(31) + static_cast<std::uint32_t>(text[i + 3]);
+    for (; i < size; ++i) hash = hash * UINT32_C(31) + static_cast<std::uint32_t>(text[i]);
+    return hash;
+}
+}
 std::int32_t string_hash(Object* object) {
     auto string = as_string(object);
     std::int32_t cached = string->cached_hash.get();
     if (cached != 0) return cached;
-    std::int32_t result = 0;
+    std::uint32_t result = 0;
     if (string->value.size() <= 1024) {
-        for (char16_t c : string->value) result = add(mul(result, std::int32_t(31)), std::int32_t(c));
+        result = hash_characters(string->value.data(), string->value.size(), result);
     } else {
         LocalRoot<String> input(string);
         for (std::size_t from = 0; from < string->value.size(); from += 1024) {
             safepoint();
             const auto end = std::min(from + 1024, string->value.size());
-            for (auto i = from; i < end; ++i)
-                result = add(mul(result, std::int32_t(31)), std::int32_t(string->value[i]));
+            result = hash_characters(string->value.data() + from, end - from, result);
         }
     }
-    if (result != 0) string->cached_hash.set(result);
-    return result;
+    if (result != 0) string->cached_hash.set(signed32(result));
+    return signed32(result);
 }
 std::int32_t string_compare(Object* first, Object* second) {
     auto a = as_string(first), b = as_string(second);
@@ -1080,7 +1244,14 @@ void string_from_chars(Object* object, Object* characters, std::int32_t offset, 
     for (std::int32_t i = 0; i < count; ++i) string->value[i] = array_get<std::uint16_t>(characters, offset + i);
 }
 std::int32_t identity_hash(Object* object) {
-    return object ? signed32(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(object))) : 0;
+    if (!object) return 0;
+    // Aligned addresses leave low bits constant, clustering identity keys in
+    // power-of-two hash tables. Mix both halves of the stable nonmoving address.
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(object));
+    std::uint32_t hash = static_cast<std::uint32_t>(address) ^ static_cast<std::uint32_t>(address >> 32);
+    hash = (hash ^ (hash >> 16)) * UINT32_C(0x85ebca6b);
+    hash = (hash ^ (hash >> 13)) * UINT32_C(0xc2b2ae35);
+    return signed32(hash ^ (hash >> 16));
 }
 Object* object_string(Object* object) {
     require_non_null(object);
@@ -1106,6 +1277,21 @@ bool object_equals(Object* object, Object* other) {
     }
     return object == other;
 }
+bool try_object_hash(std::int32_t* result, Object* object) noexcept {
+    if (!object) return false;
+    if (object->runtime_kind == RuntimeKind::string) {
+        // An installed Java substitution is authoritative even when the native
+        // representation already has a cached hash. Uncached work may poll.
+        if (substitution_policy.string_hash) return false;
+        auto string = static_cast<String*>(object);
+        const auto cached = string->cached_hash.get();
+        if (cached == 0 && !string->value.empty()) return false;
+        *result = cached;
+    } else {
+        *result = object->runtime_kind == RuntimeKind::file_path ? 0 : identity_hash(object);
+    }
+    return true;
+}
 std::int32_t object_hash(Object* object) {
     require_non_null(object);
     if (object->runtime_kind == RuntimeKind::string)
@@ -1117,6 +1303,12 @@ std::int32_t object_hash(Object* object) {
 }
 namespace {
 template<class T> void copy_primitive(Array* source, std::int32_t from, Array* target, std::int32_t to, std::int32_t count) {
+    const bool source_confined = source->array_kind == ConfinedPrimitiveArray<T>::kind;
+    const bool target_confined = target->array_kind == ConfinedPrimitiveArray<T>::kind;
+    if (source_confined || target_confined) {
+        detail::copy_confined_primitive<T>(source, from, target, to, count);
+        return;
+    }
     auto input = static_cast<PrimitiveArray<T>*>(source);
     auto output = static_cast<PrimitiveArray<T>*>(target);
     auto* input_elements = input->data();
@@ -1129,8 +1321,8 @@ template<class T> void copy_primitive(Array* source, std::int32_t from, Array* t
 }
 }
 void array_copy(Object* source, std::int32_t from, Object* target, std::int32_t to, std::int32_t count) {
-    const char source_kind = require_non_null(source)->array_kind;
-    const char target_kind = require_non_null(target)->array_kind;
+    const char source_kind = java_array_kind(require_non_null(source)->array_kind);
+    const char target_kind = java_array_kind(require_non_null(target)->array_kind);
     if (!source_kind || source_kind != target_kind) raise("java/lang/ArrayStoreException");
     auto input = static_cast<Array*>(source);
     auto output = static_cast<Array*>(target);
@@ -1140,7 +1332,7 @@ void array_copy(Object* source, std::int32_t from, Object* target, std::int32_t 
     if (references) {
         auto in = static_cast<ReferenceArray*>(input);
         auto out = static_cast<ReferenceArray*>(output);
-        if (out->accepts_any_reference || in->descriptor == out->descriptor) {
+        if (out->accepts_any_reference || std::strcmp(in->descriptor, out->descriptor) == 0) {
             // Object[] accepts every reference. Identical component types have
             // already been checked at the source array's stores.
             if (source == target && to > from) {

@@ -51,7 +51,12 @@ class BoundedCallLoopPollingTest {
         }
         assertFalse(body(cpp, "foreignLoop").contains("poll_budget"));
         String volatileLoop = body(cpp, "volatileLoop");
-        assertTrue(volatileLoop.indexOf("changing.get()") > volatileLoop.indexOf("while ("), volatileLoop);
+        // Lazy loop roots can lower the initial test separately and use do/while.
+        // In either spelling, the first volatile load must remain inside the loop.
+        int loopStart = volatileLoop.indexOf("do {");
+        if (loopStart < 0) loopStart = volatileLoop.indexOf("while (");
+        assertTrue(loopStart >= 0, volatileLoop);
+        assertTrue(volatileLoop.indexOf("changing.get()") > loopStart, volatileLoop);
         String rows = body(cpp, "rowReplacement");
         assertTrue(rows.contains("rows_elements.get_unchecked("), rows);
         assertTrue(rows.contains("::jnative::array_get<"), rows);

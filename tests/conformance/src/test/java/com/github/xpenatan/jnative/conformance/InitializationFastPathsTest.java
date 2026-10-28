@@ -109,14 +109,14 @@ class InitializationFastPathsTest {
         var generated = builder.generate();
         Path directory = generated.request().generatedSourcesDirectory();
         String header = Files.readString(directory.resolve("classes/Initialization.hpp"));
-        assertTrue(header.contains("static JNATIVE_NOINLINE void initialize_slow();"), header);
+        assertTrue(header.contains("static void ensure_initialized() {}"), header);
         StringBuilder support = new StringBuilder();
         try (var paths = Files.list(directory)) {
             for (Path path : paths.filter(p -> p.getFileName().toString().startsWith("runtime_support")
                     && p.getFileName().toString().endsWith(".cpp")).toList())
                 support.append(Files.readString(path));
         }
-        assertTrue(support.toString().contains("JNATIVE_NOINLINE void Initialization::initialize_slow() {"),
+        assertTrue(support.toString().contains("JNATIVE_NOINLINE void Initialization_Recursive::initialize_slow() {"),
                 support.toString());
         var result = builder.compile(generated);
         assertEquals(

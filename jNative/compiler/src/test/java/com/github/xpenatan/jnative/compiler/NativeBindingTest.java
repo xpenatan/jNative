@@ -12,6 +12,28 @@ import static org.junit.jupiter.api.Assertions.*;
 class NativeBindingTest {
     @TempDir Path directory;
 
+    @Test void borrowedArraysRequireARepresentableSynchronousManagedContract() {
+        MethodNode valid = imported("copy", "([FLjava/lang/Object;)V", "bridge::copy", true);
+        valid.invisibleAnnotations.getFirst().values.addAll(List.of("borrowedArrays", List.of(0, 1)));
+        assertEquals(List.of(0, 1), NativeBinding.read(owner("Demo", true), valid).borrowedArrays());
+        for(List<Integer> indexes : List.of(List.of(-1), List.of(2), List.of(0, 0))) {
+            MethodNode invalid = imported("copy", "([FI)V", "bridge::copy", true);
+            invalid.invisibleAnnotations.getFirst().values.addAll(List.of("borrowedArrays", indexes));
+            assertThrows(CompilerException.class, () -> NativeBinding.read(owner("Demo", true), invalid));
+        }
+        for(String descriptor : List.of("(I)V", "(Ljava/lang/String;)V", "([[F)V")) {
+            MethodNode invalid = imported("copy", descriptor, "bridge::copy", true);
+            invalid.invisibleAnnotations.getFirst().values.addAll(List.of("borrowedArrays", List.of(0)));
+            assertThrows(CompilerException.class, () -> NativeBinding.read(owner("Demo", true), invalid));
+        }
+        MethodNode external = imported("copy", "([F)V", "copy", false);
+        external.invisibleAnnotations.getFirst().values.addAll(List.of("borrowedArrays", List.of(0)));
+        assertThrows(CompilerException.class, () -> NativeBinding.read(owner("Demo", true), external));
+        valid.invisibleAnnotations.getFirst().values.addAll(List.of("callbacks", List.of("Demo.callback()V"),
+                "callbackKinds", List.of((Object)new String[]{"Lcom/github/xpenatan/jnative/interop/NativeImport$Invocation;", "STATIC"})));
+        assertThrows(CompilerException.class, () -> NativeBinding.read(owner("Demo", true), valid));
+    }
+
     @Test void nativeRequiresExactAnnotationIncludingFormerIntrinsics() {
         ClassNode owner = owner("java/lang/Math", false);
         MethodNode nativeMethod = method("sqrt", "(D)D");
@@ -178,6 +200,51 @@ class NativeBindingTest {
         var failure = assertThrows(CompilerException.class, () -> NativeBinding.read(owner, external));
         assertTrue(failure.getMessage().contains("managesRoots requires managed=true"));
         assertTrue(failure.getMessage().contains("Demo.driver(Ljava/lang/Object;)I"));
+    }
+
+    @Test void boundedCallbackAttemptsRequireExplicitSynchronousRuntimeContract() {
+        ClassNode owner = owner("Demo", true);
+        MethodNode method = imported("driver", "(Ljava/lang/Object;)I", "jnative::driver", true);
+        assertFalse(NativeBinding.read(owner, method).boundedCallbacks());
+        method.invisibleAnnotations.getFirst().values.addAll(List.of("boundedCallbacks", true));
+        assertThrows(CompilerException.class, () -> NativeBinding.read(owner, method));
+        method.invisibleAnnotations.getFirst().values.addAll(List.of("runtimeOnly", true));
+        assertThrows(CompilerException.class, () -> NativeBinding.read(owner, method));
+        method.invisibleAnnotations.getFirst().values.addAll(List.of("callbacksSynchronous", true));
+        assertTrue(NativeBinding.read(owner, method).boundedCallbacks());
+    }
+
+    @Test void boundedAttemptsPreserveFullEffectsAndRejectUnsafeContracts() {
+        ClassNode owner = owner("Demo", true);
+        MethodNode method = imported("hash", "(Ljava/lang/Object;)I", "jnative::hash", true);
+        assertEquals("", NativeBinding.read(owner, method).boundedAttempt());
+        method.invisibleAnnotations.getFirst().values.addAll(List.of("boundedAttempt", "jnative::try_hash"));
+        assertThrows(CompilerException.class, () -> NativeBinding.read(owner, method));
+        method.invisibleAnnotations.getFirst().values.addAll(List.of("runtimeOnly", true));
+        assertThrows(CompilerException.class, () -> NativeBinding.read(owner, method));
+        method.invisibleAnnotations.getFirst().values.addAll(List.of("targets", List.of("java/lang/Object.hashCode()I")));
+        NativeBinding binding = NativeBinding.read(owner, method);
+        assertEquals("jnative::try_hash", binding.boundedAttempt());
+        assertFalse(binding.bounded() || binding.boundedAccess());
+        for(List<Object> invalid : List.<List<Object>>of(
+                List.of("boundedAttempt", "jnative::try_hash<int>"),
+                List.of("callbacks", List.of("Demo.next()I")),
+                List.of("fields", List.of("Demo.value:I")),
+                List.of("registeredReflection", true))) {
+            MethodNode rejected = imported("hash", "(Ljava/lang/Object;)I", "jnative::hash", true);
+            rejected.invisibleAnnotations.getFirst().values = new ArrayList<>(method.invisibleAnnotations.getFirst().values);
+            // Replace rather than duplicate an annotation member.
+            if(invalid.getFirst().equals("boundedAttempt")) {
+                int slot = rejected.invisibleAnnotations.getFirst().values.indexOf("boundedAttempt") + 1;
+                rejected.invisibleAnnotations.getFirst().values.set(slot, invalid.get(1));
+            } else rejected.invisibleAnnotations.getFirst().values.addAll(invalid);
+            assertThrows(CompilerException.class, () -> NativeBinding.read(owner, rejected));
+        }
+        method.access |= Opcodes.ACC_SYNCHRONIZED;
+        assertThrows(CompilerException.class, () -> NativeBinding.read(owner, method));
+        method.access &= ~Opcodes.ACC_SYNCHRONIZED;
+        method.desc = "(Ljava/lang/Object;)V";
+        assertThrows(CompilerException.class, () -> NativeBinding.read(owner, method));
     }
 
     @Test void registeredReflectionRequiresManagedModeAndConservativeEffects() {

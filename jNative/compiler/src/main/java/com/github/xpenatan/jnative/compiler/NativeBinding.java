@@ -10,7 +10,8 @@ import java.util.*;
 public record NativeBinding(String symbol, String include, boolean managed, boolean leaf,
                             boolean bounded, List<Callback> callbacks, List<Field> fields, List<String> types,
                             boolean boundedAccess, boolean runtimeOnly, boolean callbacksSynchronous, boolean managesRoots,
-                            boolean registeredReflection) {
+                            boolean registeredReflection, boolean boundedCallbacks, String boundedAttempt,
+                            List<Integer> borrowedArrays) {
     private static final String OWNER = "[A-Za-z_$][A-Za-z_0-9$]*(/[A-Za-z_$][A-Za-z_0-9$]*)*";
     private static final String VALUE_TYPE = "(?:\\[*[ZBCSIJFD]|\\[*L" + OWNER + ";)";
     private static final String METHOD_TYPE = "\\(" + VALUE_TYPE + "*\\)(?:V|" + VALUE_TYPE + ")";
@@ -22,6 +23,33 @@ public record NativeBinding(String symbol, String include, boolean managed, bool
         callbacks = List.copyOf(callbacks);
         fields = List.copyOf(fields);
         types = List.copyOf(types);
+        borrowedArrays = List.copyOf(borrowedArrays);
+    }
+
+    public NativeBinding(String symbol, String include, boolean managed, boolean leaf,
+                         boolean bounded, List<Callback> callbacks, List<Field> fields, List<String> types,
+                         boolean boundedAccess, boolean runtimeOnly, boolean callbacksSynchronous,
+                         boolean managesRoots, boolean registeredReflection, boolean boundedCallbacks,
+                         String boundedAttempt) {
+        this(symbol, include, managed, leaf, bounded, callbacks, fields, types, boundedAccess,
+                runtimeOnly, callbacksSynchronous, managesRoots, registeredReflection, boundedCallbacks,
+                boundedAttempt, List.of());
+    }
+
+    public NativeBinding(String symbol, String include, boolean managed, boolean leaf,
+                         boolean bounded, List<Callback> callbacks, List<Field> fields, List<String> types,
+                         boolean boundedAccess, boolean runtimeOnly, boolean callbacksSynchronous,
+                         boolean managesRoots, boolean registeredReflection, boolean boundedCallbacks) {
+        this(symbol, include, managed, leaf, bounded, callbacks, fields, types, boundedAccess,
+                runtimeOnly, callbacksSynchronous, managesRoots, registeredReflection, boundedCallbacks, "");
+    }
+
+    public NativeBinding(String symbol, String include, boolean managed, boolean leaf,
+                         boolean bounded, List<Callback> callbacks, List<Field> fields, List<String> types,
+                         boolean boundedAccess, boolean runtimeOnly, boolean callbacksSynchronous,
+                         boolean managesRoots, boolean registeredReflection) {
+        this(symbol, include, managed, leaf, bounded, callbacks, fields, types, boundedAccess,
+                runtimeOnly, callbacksSynchronous, managesRoots, registeredReflection, false);
     }
 
     public static NativeBinding read(ClassNode owner, MethodNode method) {
@@ -128,11 +156,36 @@ public record NativeBinding(String symbol, String include, boolean managed, bool
         if(callbacksSynchronous && !managed) throw error(id, "callbacksSynchronous requires managed=true");
         boolean managesRoots = Annotations.flag(annotations, "NativeImport", "managesRoots");
         if(managesRoots && !managed) throw error(id, "managesRoots requires managed=true");
+        boolean boundedCallbacks = Annotations.flag(annotations, "NativeImport", "boundedCallbacks");
+        if(boundedCallbacks && (!runtimeOnly || !callbacksSynchronous))
+            throw error(id, "boundedCallbacks requires runtimeOnly and callbacksSynchronous");
         boolean registeredReflection = Annotations.flag(annotations, "NativeImport", "registeredReflection");
         if(registeredReflection && !managed) throw error(id, "registeredReflection requires managed=true");
         if(registeredReflection && (bounded || boundedAccess))
             throw error(id, "registeredReflection cannot use bounded or boundedAccess promises");
-        return new NativeBinding(symbol, include, managed, leaf, bounded, callbacks, fields, types, boundedAccess, runtimeOnly, callbacksSynchronous, managesRoots, registeredReflection);
+        Object attemptValue = Annotations.property(annotations, "NativeImport", "boundedAttempt");
+        String boundedAttempt = attemptValue == null ? "" : (String) attemptValue;
+        if(!boundedAttempt.isEmpty() && (!runtimeOnly || registeredReflection || !callbacks.isEmpty()
+                || !fields.isEmpty() || list(annotations, "targets").isEmpty()
+                || Type.getReturnType(method.desc).equals(Type.VOID_TYPE)
+                || (method.access & Opcodes.ACC_SYNCHRONIZED) != 0
+                || !boundedAttempt.matches("[A-Za-z_][A-Za-z_0-9]*(::[A-Za-z_][A-Za-z_0-9]*)*")))
+            throw error(id, "boundedAttempt requires a qualified symbol and a runtime-only, non-void platform target without callbacks, fields or a monitor");
+        var borrowedArrays = new ArrayList<Integer>();
+        for(Object value : list(annotations, "borrowedArrays")) {
+            if(!(value instanceof Integer index) || index < 0 || index >= arguments.length
+                    || borrowedArrays.contains(index))
+                throw error(id, "borrowedArrays requires unique valid argument indexes");
+            String descriptor = arguments[index].getDescriptor();
+            if(!descriptor.equals("Ljava/lang/Object;")
+                    && !(descriptor.length() == 2 && descriptor.charAt(0) == '['
+                    && "ZBCSIJFD".indexOf(descriptor.charAt(1)) >= 0))
+                throw error(id, "borrowedArrays requires primitive-array or Object parameters");
+            borrowedArrays.add(index);
+        }
+        if(!borrowedArrays.isEmpty() && (!managed || !callbacks.isEmpty()))
+            throw error(id, "borrowedArrays requires managed=true without callbacks");
+        return new NativeBinding(symbol, include, managed, leaf, bounded, callbacks, fields, types, boundedAccess, runtimeOnly, callbacksSynchronous, managesRoots, registeredReflection, boundedCallbacks, boundedAttempt, borrowedArrays);
     }
 
     /** Conservative proof for bypassing a platform helper's initialization adapter. */

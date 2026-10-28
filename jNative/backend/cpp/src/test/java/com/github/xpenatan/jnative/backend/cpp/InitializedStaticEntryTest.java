@@ -25,7 +25,7 @@ class InitializedStaticEntryTest {
         Path source = directory.resolve("InitializedEntries.java");
         Files.writeString(source, """
                 public class InitializedEntries extends Parent {
-                    static int initialized_step;
+                    static int initialized_step = 1;
                     static int initialized_step_2(int x) { return x-1; }
                     static class initialized_step_3 {}
                     static class Foreign {

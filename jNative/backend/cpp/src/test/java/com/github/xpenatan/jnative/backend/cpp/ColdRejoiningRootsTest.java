@@ -59,6 +59,13 @@ class ColdRejoiningRootsTest {
                         }
                         return value[0];
                     }
+                    static int nested(int[] value, boolean enabled, boolean cold) {
+                        if (enabled) {
+                            if (cold) System.gc();
+                            value[0]++;
+                        }
+                        return value[0];
+                    }
                     static int scalarRecursive(boolean cold, int depth) {
                         if (cold) {
                             if (depth > 0) return scalarRecursive(cold, depth - 1);
@@ -110,6 +117,7 @@ class ColdRejoiningRootsTest {
                         System.out.println(loop(value, 3) + caught(value, true));
                         System.out.println(locked(value, true) + initializing(value, true));
                         System.out.println(recursive(value, true, 3) + scalarRecursive(true, 3));
+                        System.out.println(nested(value, true, false));
                         ColdRejoiningRoots owner = new ColdRejoiningRoots(); owner.field = value;
                         System.out.println(consumedBeforeCollection(owner, true));
                     }
@@ -121,7 +129,7 @@ class ColdRejoiningRootsTest {
                 directory.resolve("out"), null, null, "cold-roots", BuildType.DEBUG, false);
         String cpp = new CppEmitter().emit(new BytecodeCompiler().compile(request), request)
                 .get("classes/ColdRejoiningRoots.cpp");
-        for(String name : List.of("rejoin", "returned", "recursive", "consumedBeforeCollection")) {
+        for(String name : List.of("rejoin", "returned", "recursive", "nested", "consumedBeforeCollection")) {
             String body = body(cpp, name);
             assertTrue(body.contains("RootValue<>"), body);
             assertTrue(body.contains("RootAddressFrame<"), body);
@@ -137,6 +145,9 @@ class ColdRejoiningRootsTest {
                     .contains("safepoint"), body);
         }
         String rejoin = body(cpp, "rejoin");
+        String nested = body(cpp, "nested");
+        nested = nested.substring(nested.indexOf("if (enabled"));
+        assertTrue(nested.indexOf("RootAddressFrame<") > nested.indexOf("if (cold"), nested);
         assertTrue(rejoin.contains("RootValue<> temporary(nullptr)"), rejoin);
         assertTrue(rejoin.substring(rejoin.indexOf("if (cold"))
                 .contains("temporary.address()"), rejoin);

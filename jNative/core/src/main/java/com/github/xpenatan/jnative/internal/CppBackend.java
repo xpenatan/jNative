@@ -77,6 +77,8 @@ public final class CppBackend implements NativeBackend {
                             "jn_platform_windows.cpp",
                             "jn_platform_linux.cpp",
                             "jn_runtime.hpp",
+                            "jn_allocator.hpp",
+                            "jn_allocator.cpp",
                             "jn_arrays.hpp",
                             "jn_array_algorithms.hpp",
                             "jn_arrays.cpp",
@@ -122,7 +124,6 @@ public final class CppBackend implements NativeBackend {
                             "jn_diagnostic_common.hpp",
                             "jn_crash_protocol.hpp",
                             "jn_diagnostic_tool.cpp",
-                            "jn_core_decode.py",
                             "jn_diagnostics.cmake",
                             "jn_identity.cmake",
                             "jn_archive.cmake",
@@ -178,6 +179,7 @@ public final class CppBackend implements NativeBackend {
             sourceList.append(")\nset(JNATIVE_RUNTIME_SOURCES\n");
             var runtimeSources =
                     List.of(
+                            "jn_allocator.cpp",
                             "jn_classlib_numbers.cpp",
                             "jn_arrays.cpp",
                             "jn_string_kernels.cpp",
@@ -471,7 +473,8 @@ public final class CppBackend implements NativeBackend {
                             MSVC/PDB, macOS and ARM64 diagnostics are not validated and are rejected.
 
                             Developer commands: jnative decode --report report.json --symbols /private/symbols
-                            Add --from-dump for Windows minidump unwinding, or --core game.core for Linux GDB.
+                            Add --from-dump for Windows minidump unwinding. Linux core-file decoding is unavailable;
+                            decode the captured crash report or inspect the core manually with the archived image.
                             jnative extract-sources --symbols /private/symbols/BUILD_ID --destination /sources/BUILD_ID
                             extracts the exact checked C++ snapshot. Java provenance after native edits
                             is marked stale; C++ locations still refer to the compiled source.

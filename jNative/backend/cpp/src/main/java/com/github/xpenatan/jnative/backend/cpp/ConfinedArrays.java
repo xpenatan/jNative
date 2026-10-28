@@ -24,12 +24,18 @@ final class ConfinedArrays extends BasicInterpreter {
     private final Set<AbstractInsnNode> escaped =
             Collections.newSetFromMap(new IdentityHashMap<>());
     private final Map<AbstractInsnNode, AbstractInsnNode> uses = new IdentityHashMap<>();
+    private final ArrayBorrowing borrowing;
 
-    private ConfinedArrays() {
+    private ConfinedArrays(ArrayBorrowing borrowing) {
         super(ASM9);
+        this.borrowing = borrowing;
     }
 
     static Set<AbstractInsnNode> analyze(String owner, MethodNode method) {
+        return analyze(owner, method, null);
+    }
+
+    static Set<AbstractInsnNode> analyze(String owner, MethodNode method, ArrayBorrowing borrowing) {
         if(!method.tryCatchBlocks.isEmpty() || method.instructions.size() > 4096) return Set.of();
         boolean hasArray = false;
         for(AbstractInsnNode instruction : method.instructions)
@@ -38,7 +44,7 @@ final class ConfinedArrays extends BasicInterpreter {
                 break;
             }
         if(!hasArray) return Set.of();
-        ConfinedArrays analysis = new ConfinedArrays();
+        ConfinedArrays analysis = new ConfinedArrays(borrowing);
         try {
             new Analyzer<>(analysis).analyze(owner, method);
         } catch(AnalyzerException ignored) {
@@ -117,7 +123,9 @@ final class ConfinedArrays extends BasicInterpreter {
     @Override
     public BasicValue naryOperation(AbstractInsnNode instruction, List<? extends BasicValue> values)
             throws AnalyzerException {
-        for(BasicValue value : values) escape(value);
+        for(int i = 0; i < values.size(); ++i)
+            if(values.get(i) instanceof ArrayValue
+                    && (borrowing == null || !borrowing.borrows(instruction, i))) escape(values.get(i));
         return super.naryOperation(instruction, values);
     }
 

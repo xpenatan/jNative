@@ -26,7 +26,7 @@ class LastUseArgumentRootsTest {
         Path source = directory.resolve("LastUseRoots.java");
         Files.writeString(source, """
                 public class LastUseRoots extends RootParent {
-                    static int scalar;
+                    static int scalar = 1;
                     interface Sink { void accept(int[] a,boolean c); }
                     static class First implements Sink {
                         public void accept(int[] a,boolean c) { if(c) System.gc(); scalar+=a[0]; }

@@ -18,7 +18,7 @@ class LinuxCrashWorkflowTest {
 
     @ParameterizedTest
     @EnumSource(BuildType.class)
-    void fallbackAndCoreDecodeWithArchivedRelease(BuildType type) throws Exception {
+    void fallbackReportsWithArchivedRelease(BuildType type) throws Exception {
         Path source = temporary.resolve("Player.java"), classes = temporary.resolve("classes");
         Files.writeString(
                 source,
@@ -108,18 +108,14 @@ class LinuxCrashWorkflowTest {
                 project.resolve(type.name().toLowerCase(Locale.ROOT))
                         .resolve(generation.request().targetFileName());
         for(String mode : List.of("main", "worker")) {
-            Path reports = temporary.resolve("reports-" + mode),
-                    runner = temporary.resolve("run-" + mode + ".py");
-            Files.writeString(
-                    runner,
-                    """
-                            import os, resource, sys
-                            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-                            os.environ["JNATIVE_REPORT_DIR"] = sys.argv[1]
-                            os.environ["JNATIVE_TEST_NO_CORE"] = "1"
-                            os.execv(sys.argv[2], sys.argv[2:])
-                            """);
-            var crash = wsl("python3", linux(runner), linux(reports), linux(executable), mode);
+            Path reports = temporary.resolve("reports-" + mode);
+            var crash = wsl("bash", "-c", """
+                    ulimit -c 0
+                    export JNATIVE_REPORT_DIR="$1"
+                    export JNATIVE_TEST_NO_CORE=1
+                    shift
+                    exec "$@"
+                    """, "jnative-crash", linux(reports), linux(executable), mode);
             assertNotEquals(0, crash.exitCode(), crash.text());
             Path report = NativeDiagnostics.pendingReports(reports).getFirst();
             var raw = Json.object(Json.read(Files.readString(report)));
@@ -129,59 +125,11 @@ class LinuxCrashWorkflowTest {
             if(type == BuildType.DEBUG)
                 assertTrue(fallback.text().contains("player_native.cpp"), fallback.text());
             else assertTrue(fallback.text().contains("symbols unavailable"), fallback.text());
-            Path core = temporary.resolve(mode + ".core");
-            // Generate a core under a debugger without altering the host's global core policy.
-            var captured =
-                    wsl(
-                            "gdb",
-                            "-nx",
-                            "-nh",
-                            "-batch",
-                            "-iex",
-                            "set auto-load off",
-                            "-ex",
-                            "set pagination off",
-                            "-ex",
-                            "run",
-                            "-ex",
-                            "generate-core-file " + linux(core),
-                            "-ex",
-                            "set confirm off",
-                            "-ex",
-                            "kill",
-                            "--args",
-                            linux(executable),
-                            mode);
-            assertEquals(0, captured.exitCode(), captured.text());
-            assertTrue(Files.size(core) > 0, captured.text());
-            var decoded = NativeDiagnostics.decodeCore(report, core, store, "gdb");
-            assertTrue(
-                    decoded.text().contains("crash_player")
-                            && decoded.text().contains("player_native.cpp"),
-                    decoded.text());
-            assertTrue(decoded.json().contains("linux-x64"));
-            var coreData = Json.object(Json.read(decoded.json()));
-            assertTrue(
-                    Json.array(coreData.get("threads")).stream()
-                            .flatMap(
-                                    thread ->
-                                            Json.array(Json.object(thread).get("decodedFrames"))
-                                                    .stream())
-                            .map(Json::object)
-                            .anyMatch(
-                                    frame ->
-                                            "user/player_native.cpp".equals(frame.get("sourceFile"))
-                                                    && "archived".equals(frame.get("sourceStatus"))
-                                                    && Objects.toString(
-                                                            frame.get("sourceSha256"), "")
-                                                    .matches("[0-9a-f]{64}")),
-                    decoded.json());
-            raw.put("schema", 99);
-            Path invalidReport = temporary.resolve("invalid-core-report.json");
-            Files.writeString(invalidReport, Json.write(raw));
-            assertThrows(
+            var unavailable = assertThrows(
                     CompilerException.class,
-                    () -> NativeDiagnostics.decodeCore(invalidReport, core, store, "gdb"));
+                    () -> NativeDiagnostics.decodeCore(
+                            report, temporary.resolve(mode + ".core"), store, "gdb"));
+            assertTrue(unavailable.getMessage().contains("core decoding is unavailable"));
         }
     }
 

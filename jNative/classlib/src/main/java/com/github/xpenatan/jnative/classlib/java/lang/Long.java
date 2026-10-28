@@ -14,10 +14,11 @@ public final class Long extends Number implements Comparable<Long> {
     @NativeImport(value = "jnative::long_leading_zeros", managed = true, runtimeOnly = true, bounded = true)
     public static native int numberOfLeadingZeros(long value);
 
-    private static final Long[] CACHE = new Long[256];
-
-    static {
-        for(int i = 0; i < 256; ++i) CACHE[i] = new Long(i - 128);
+    private static final class Cache {
+        static final Long[] VALUES = new Long[256];
+        static {
+            for(int i = 0; i < VALUES.length; ++i) VALUES[i] = new Long(i - 128);
+        }
     }
 
     public static long parseLong(String text) {
@@ -36,7 +37,8 @@ public final class Long extends Number implements Comparable<Long> {
     }
 
     public static Long valueOf(long value) {
-        return value >= -128 && value <= 127 ? CACHE[(int)value + 128] : new Long(value);
+        if(value >= -128 && value <= 127) return Cache.VALUES[(int)value + 128];
+        return new Long(value);
     }
 
     public int intValue() {
@@ -68,7 +70,7 @@ public final class Long extends Number implements Comparable<Long> {
     }
 
     public int hashCode() {
-        return hashCode(value);
+        return (int)(value ^ (value >>> 32));
     }
 
     public static int hashCode(long value) {

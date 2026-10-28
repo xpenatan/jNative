@@ -57,15 +57,20 @@ public final class CppEmitter implements Opcodes {
     private int index;
     private CppNames names;
     private MethodEffects methodEffects;
+    private ClassInitializationEffects classInitializationEffects;
     private CallTargets callTargets;
     private OwnedArrays ownedArrays;
+    private Map<MethodId, List<ArrayStorage.Mode>> arrayInputs;
+    private ArrayBorrowing arrayBorrowing;
+    private ReferenceStores referenceStores;
     private Set<MethodId> initializedEntries = Set.of();
     private Set<MethodId> inlineInitializedEntries = Set.of();
+    private Set<MethodId> protectedCallbackTargets = Set.of();
     private final Map<String, Integer> classIds = new HashMap<>();
     private final Map<String, Integer> stringLiterals = new LinkedHashMap<>();
     private final Map<String, Integer> classLiterals = new LinkedHashMap<>();
-    private final Set<MethodId> boundedRuntimeCalls = new HashSet<>();
     private final Map<MethodId, Boolean> boundedRuntimeEffects = new HashMap<>();
+    private final Map<MethodId, Boolean> referencePreservingLeaves = new HashMap<>();
     private boolean readableLibraryCalls;
     private final List<ReadabilityFallback> readabilityFallbacks = new ArrayList<>();
     private static final MethodId TO_STRING =
@@ -88,14 +93,19 @@ public final class CppEmitter implements Opcodes {
                 ? Map.<MethodId, SubstitutionRegistry.MethodOrigin>of() : program.substitutions().methodOrigins();
         this.names = new CppNames(program, request.sourceLayout());
         this.callTargets = new CallTargets(program);
-        this.ownedArrays = new OwnedArrays(program);
+        this.arrayBorrowing = new ArrayBorrowing(program);
+        this.ownedArrays = new OwnedArrays(program, arrayBorrowing);
+        this.arrayInputs = ArrayStorage.inputs(program, ownedArrays, arrayBorrowing);
+        this.referenceStores = new ReferenceStores(program, ownedArrays);
+        this.classInitializationEffects = new ClassInitializationEffects(program);
         initializedEntries = Set.of();
         inlineInitializedEntries = Set.of();
+        protectedCallbackTargets = Set.of();
         classIds.clear();
         stringLiterals.clear();
         classLiterals.clear();
-        boundedRuntimeCalls.clear();
         boundedRuntimeEffects.clear();
+        referencePreservingLeaves.clear();
         for(String owner : new TreeSet<>(program.classes().keySet()))
             classIds.put(owner, classIds.size() + 1);
         this.out = new StringBuilder();
@@ -217,11 +227,14 @@ public final class CppEmitter implements Opcodes {
         line("}");
         out = support.boundary(out, true);
         emitInitializers(support);
-        emitDispatchers(header, support);
+        declareDispatchers(header);
         emitMethodAdapters(support);
         emitClassSupport(header, support);
         line("}\n");
-        methodEffects = new MethodEffects(program, this::boundedIntrinsic, this::cooperativeRuntimeCall);
+        methodEffects = new MethodEffects(program, this::boundedIntrinsic, this::cooperativeRuntimeCall,
+                referenceStores::bounded, instruction -> instruction instanceof TypeInsnNode type
+                        && (type.getOpcode() == INSTANCEOF || type.getOpcode() == CHECKCAST)
+                        && exactTypeCheck(type.desc), this::emptyInitialization);
         // A body that falls back gains an entry poll. Prove the actual lowering
         // before any caller is allowed to omit roots based on its summary.
         Set<MethodId> fallbackEffects = new HashSet<>();
@@ -310,8 +323,15 @@ public final class CppEmitter implements Opcodes {
                         : new ReadableMethodEmitter(this, program, names, request, candidate).emit());
             }
         }
+        Set<MethodId> callbackTargets = new HashSet<>();
+        for(MethodId id : program.methods().keySet())
+            if(targetProtectsArguments(id, finalizedReadable)) callbackTargets.add(id);
+        protectedCallbackTargets = Set.copyOf(callbackTargets);
         emitClasses(header, sources);
         sources.put("method-effects.tsv", methodEffects.report());
+        line("namespace generated {");
+        emitDispatchers(support, finalizedReadable);
+        line("}\n");
         emitRuntimeAdapters(sources, support);
         support.finish(out);
         for(ClassNode owner : program.classes().values()) {
@@ -928,16 +948,10 @@ public final class CppEmitter implements Opcodes {
                 return;
             }
             if(opcode == ANEWARRAY) {
-                String descriptor =
-                        type.desc.startsWith("[") ? "[" + type.desc : "[L" + type.desc + ";";
                 push(
                         size - 1,
                         Type.getType(Object.class),
-                        "::jnative::new_array("
-                                + quote(descriptor)
-                                + ", "
-                                + read("stack", size - 1, Type.INT_TYPE)
-                                + ")");
+                        referenceArrayAllocation(type.desc, read("stack", size - 1, Type.INT_TYPE)));
                 return;
             }
             if(opcode == CHECKCAST) {
@@ -1012,7 +1026,8 @@ public final class CppEmitter implements Opcodes {
             String value = read("stack", size - 1, arrayStackType(opcode - IASTORE));
             String access =
                     switch(opcode) {
-                        case AASTORE -> "::jnative::reference_set";
+                        case AASTORE -> boundedReferenceStore(method.id(), instruction)
+                                ? "::jnative::reference_set_exact" : "::jnative::reference_set";
                         case BASTORE -> "::jnative::byte_set";
                         default -> "::jnative::"
                                 + (ownedArrays
@@ -1423,11 +1438,16 @@ public final class CppEmitter implements Opcodes {
         if((method.bytecode().access & ACC_SYNCHRONIZED) != 0)
             line("    ::jnative::MonitorGuard synchronized_method(::jnative::class_object(" + quote(method.id().owner()) + "));");
         if(!nativeRoots && !binding.bounded()) line("    ::jnative::safepoint();");
-        for(NativeBinding.Callback callback : binding.callbacks()) args.add(callbackPointer(callback));
+        for(NativeBinding.Callback callback : binding.callbacks())
+            args.add(callbackPointer(callback, binding.runtimeOnly(), binding.boundedCallbacks()));
         for(NativeBinding.Field field : binding.fields()) {
             String owner = className(field.owner());
             String member = fieldName(field.owner(), field.name(), field.descriptor());
-            args.add("::jnative::NativeFieldAccess<" + owner + ", decltype(" + owner + "::" + member + ")>(&" + owner + "::" + member + ")");
+            if(binding.runtimeOnly())
+                args.add("::jnative::BoundNativeFieldAccess<" + owner + ", decltype(" + owner + "::" + member
+                        + "), &" + owner + "::" + member + ">{}");
+            else
+                args.add("::jnative::NativeFieldAccess<" + owner + ", decltype(" + owner + "::" + member + ")>(&" + owner + "::" + member + ")");
         }
         Type result = Type.getReturnType(method.id().descriptor());
         line("    try {");
@@ -1438,7 +1458,83 @@ public final class CppEmitter implements Opcodes {
         line("    catch (const std::exception& error) { ::jnative::raise_native(error); }");
     }
 
-    private String callbackPointer(NativeBinding.Callback callback) {
+    private String callbackPointer(NativeBinding.Callback callback, boolean runtimeOnly, boolean boundedCallbacks) {
+        boolean optional = boundedCallbacks && (callback.invocation() == NativeBinding.Invocation.VIRTUAL
+                || callback.invocation() == NativeBinding.Invocation.INTERFACE);
+        String full = callbackFunction(callback, runtimeOnly, boundedCallbacks);
+        if(!optional) return full;
+        MethodId id = callback.method();
+        Type returned = Type.getReturnType(id.descriptor());
+        String result = type(returned);
+        var declarations = new ArrayList<>(List.of(result + "* result", "::jnative::Object* receiver"));
+        var args = new ArrayList<String>();
+        Type[] parameters = Type.getArgumentTypes(id.descriptor());
+        for(int i = 0; i < parameters.length; ++i) {
+            declarations.add(type(parameters[i]) + " arg" + i);
+            args.add("arg" + i);
+        }
+        StringBuilder bounded = new StringBuilder("[](").append(String.join(", ", declarations))
+                .append(") -> bool { if (!receiver) return false; switch (receiver->type_id()) { ");
+        Map<MethodId, List<String>> implementations = new LinkedHashMap<>();
+        for(String implementation : new TreeSet<>(program.instantiatedClasses())) {
+            if(program.platform(implementation) || !subtype(implementation, id.owner())) continue;
+            MethodId target;
+            try { target = resolve(implementation, id.name(), id.descriptor()); }
+            catch(CompilerException unresolved) { continue; }
+            Program.Method method = program.methods().get(target);
+            if(boundedRuntimeAttempt(target).isEmpty() && (method == null || method.nativeSymbol() != null
+                    || isInterface(target.owner()) || !methodEffects.bounded(target))) continue;
+            implementations.computeIfAbsent(target, ignored -> new ArrayList<>()).add(implementation);
+        }
+        for(var entry : implementations.entrySet()) {
+            MethodId target = entry.getKey();
+            if(!boundedRuntimeAttempt(target).isEmpty()) continue;
+            for(String implementation : entry.getValue())
+                bounded.append("case ").append(className(implementation)).append("::class_id: ");
+            if(!returned.equals(Type.VOID_TYPE)) bounded.append("*result = ");
+            bounded.append("static_cast<").append(className(target.owner())).append("*>(receiver)->")
+                    .append(names.simpleName(target.owner())).append("::").append(memberName(target))
+                    .append('(').append(String.join(", ", args)).append("); return true; ");
+        }
+        // Many classes inherit one runtime implementation. Keep those type-id
+        // groups out of the small dispatch for concrete Java implementations;
+        // otherwise they can force an indirect jump table for a few tiny methods.
+        if(implementations.keySet().stream().anyMatch(target -> !boundedRuntimeAttempt(target).isEmpty())) {
+            bounded.append("default: break; } switch (receiver->type_id()) { ");
+            for(var entry : implementations.entrySet()) {
+                String attempt = boundedRuntimeAttempt(entry.getKey());
+                if(attempt.isEmpty()) continue;
+                for(String implementation : entry.getValue())
+                    bounded.append("case ").append(className(implementation)).append("::class_id: ");
+                bounded.append("return ::").append(attempt).append("(result, receiver")
+                        .append(args.isEmpty() ? "" : ", " + String.join(", ", args)).append("); ");
+            }
+        }
+        String fallback = boundedRuntimeAttempt(resolve(id.owner(), id.name(), id.descriptor()));
+        bounded.append("default: return ");
+        if(fallback.isEmpty()) bounded.append("false");
+        else {
+            // Runtime objects use type id zero. Generated overrides and unknown
+            // generated classes must never fall through to a native base helper.
+            bounded.append("receiver->type_id() == 0 && ::").append(fallback).append("(result, receiver")
+                    .append(args.isEmpty() ? "" : ", " + String.join(", ", args)).append(')');
+        }
+        bounded.append("; } }");
+        return "::jnative::make_runtime_callback(" + full + ", " + bounded + ")";
+    }
+
+    private String boundedRuntimeAttempt(MethodId id) {
+        if(!program.platform(id.owner())) return "";
+        PlatformBindings.Target route = program.bindings().find(id);
+        if(route == null || !route.instance()) return "";
+        Program.Method helper = program.methods().get(route.helper());
+        if(helper == null || helper.nativeBinding() == null || !helper.nativeBinding().equals(route.binding())
+                || (helper.bytecode().access & ACC_SYNCHRONIZED) != 0
+                || !NativeBinding.trivialInitialization(program.classes().get(route.helper().owner()))) return "";
+        return helper.nativeBinding().boundedAttempt();
+    }
+
+    private String callbackFunction(NativeBinding.Callback callback, boolean runtimeOnly, boolean protectedCallback) {
         MethodId id = callback.method();
         var parameterTypes = new ArrayList<String>();
         var declarations = new ArrayList<String>();
@@ -1456,10 +1552,22 @@ public final class CppEmitter implements Opcodes {
         }
         String result = type(Type.getReturnType(id.descriptor()));
         MethodId target = resolve(id.owner(), id.name(), id.descriptor());
+        boolean targetProtects = protectedCallbackTargets.contains(target);
         String call;
         if(callback.invocation() == NativeBinding.Invocation.VIRTUAL || callback.invocation() == NativeBinding.Invocation.INTERFACE) {
             Program.Method declaration = program.methods().get(target);
-            if(callback.invocation() == NativeBinding.Invocation.VIRTUAL
+            MethodId direct = runtimeOnly ? directTarget(new MethodInsnNode(
+                    callback.invocation() == NativeBinding.Invocation.INTERFACE ? INVOKEINTERFACE : INVOKEVIRTUAL,
+                    id.owner(), id.name(), id.descriptor(), callback.invocation() == NativeBinding.Invocation.INTERFACE)) : null;
+            if(direct != null && !isInterface(direct.owner())) {
+                targetProtects = protectedCallbackTargets.contains(direct);
+                // Apply the same closed-program target proof as ordinary Java calls.
+                // A qualified member call lets C++ inline a unique callback body;
+                // multiple implementations retain their virtual dispatch below.
+                call = "static_cast<" + className(direct.owner()) + "*>(::jnative::require_non_null(receiver))->"
+                        + names.simpleName(direct.owner()) + "::" + memberName(direct)
+                        + "(" + String.join(", ", args) + ")";
+            } else if(callback.invocation() == NativeBinding.Invocation.VIRTUAL
                     && !program.platform(id.owner()) && !isInterface(id.owner())
                     && !program.platform(target.owner()) && !isInterface(target.owner())
                     && declaration != null && (declaration.bytecode().access & (ACC_STATIC | ACC_PRIVATE)) == 0) {
@@ -1467,6 +1575,10 @@ public final class CppEmitter implements Opcodes {
                 // virtual member so source-class overrides dispatch without another root frame.
                 call = "static_cast<" + className(target.owner()) + "*>(::jnative::require_non_null(receiver))->"
                         + memberName(target) + "(" + String.join(", ", args) + ")";
+                targetProtects = false; // A different overriding body may be selected.
+            } else if(protectedCallback) {
+                call = names.call(id) + "(receiver" + (args.isEmpty() ? "" : ", " + String.join(", ", args)) + ")";
+                targetProtects = true; // Each dispatch branch protects its selected target.
             } else
                 return "static_cast<" + result + " (*)(" + String.join(", ", parameterTypes) + ")>(" + names.call(id) + ")";
         } else if(program.platform(target.owner()) || !program.methods().containsKey(target))
@@ -1476,8 +1588,23 @@ public final class CppEmitter implements Opcodes {
             if(instance) args.addFirst("receiver");
             call = symbol(target) + "(" + String.join(", ", args) + ")";
         }
-        return "+[](" + String.join(", ", declarations) + ") -> " + result + " { "
-                + (result.equals("void") ? "" : "return ") + call + "; }";
+        StringBuilder protection = new StringBuilder();
+        if(protectedCallback && !targetProtects) {
+            List<String> references = new ArrayList<>();
+            if(instance) references.add("receiver");
+            for(int i = 0; i < types.length; ++i)
+                if(reference(types[i])) references.add("arg" + i);
+            if(!references.isEmpty()) {
+                protection.append("::jnative::RootFrame<").append(references.size()).append("> callback_roots; ");
+                for(int i = 0; i < references.size(); ++i)
+                    protection.append("callback_roots.slot(").append(i).append(") = ")
+                            .append(references.get(i)).append("; ");
+            }
+        }
+        // Keep the concrete callable type for templated built-in drivers. User
+        // native adapters retain their function-pointer calling convention.
+        return (runtimeOnly ? "[](" : "+[](") + String.join(", ", declarations) + ") -> " + result + " { "
+                + protection + (result.equals("void") ? "" : "return ") + call + "; }";
     }
 
     private void stackPermutation(int opcode, Frame<BasicValue> frame) {
@@ -1551,9 +1678,21 @@ public final class CppEmitter implements Opcodes {
         throw new CompilerException("JN1002 Unresolved method " + owner + "." + name + descriptor);
     }
 
+    String referenceArrayAllocation(String component, String length) {
+        String descriptor = component.startsWith("[") ? "[" + component : "[L" + component + ";";
+        String componentId = classIds.containsKey(component) ? className(component) + "::class_id" : "0";
+        return "::jnative::ReferenceArray::create(" + length + ", " + quote(descriptor) + ", " + componentId + ")";
+    }
+
     String typeCheckArgument(String owner) {
         return quote(owner)
                 + (classIds.containsKey(owner) ? ", " + className(owner) + "::class_id" : "");
+    }
+
+    boolean exactTypeCheck(String owner) {
+        ClassNode node = program.classes().get(owner);
+        return node != null && (node.access & (ACC_FINAL | ACC_INTERFACE)) == ACC_FINAL
+                && classIds.containsKey(owner) && !program.platform(owner);
     }
 
     private void emitTypeChecks(StringBuilder header, Map<String, String> sources) {
@@ -1715,12 +1854,13 @@ public final class CppEmitter implements Opcodes {
                     .append(
                             "\n"
                                     + "    static std::atomic<bool> initialization_complete;\n"
-                                    + "    static JNATIVE_NOINLINE void initialize_slow();\n"
+                                    + (emptyInitialization(node.name) ? "    static void ensure_initialized() {}\n" :
+                                    "    static JNATIVE_NOINLINE void initialize_slow();\n"
                                     + "    static void ensure_initialized() {\n"
                                     + "        if"
                                     + " (!initialization_complete.load(std::memory_order_acquire))"
                                     + " initialize_slow();\n"
-                                    + "    }\n"
+                                    + "    }\n")
                                     + "    const char* type_name() const override;\n"
                                     + "    void trace(::jnative::Tracer& tracer) override;\n"
                                     + "};\n")
@@ -1774,7 +1914,8 @@ public final class CppEmitter implements Opcodes {
                             ? className(node.superName)
                             : nativeBase(
                             node.superName == null ? "java/lang/Object" : node.superName);
-            line("std::atomic<bool> " + qualified + "::initialization_complete{false};");
+            line("std::atomic<bool> " + qualified + "::initialization_complete{"
+                    + emptyInitialization(node.name) + "};");
             line(
                     "const char* "
                             + qualified
@@ -1886,6 +2027,7 @@ public final class CppEmitter implements Opcodes {
 
     private void emitInitializers(SupportSources support) {
         for(ClassNode node : program.classes().values()) {
+            if(emptyInitialization(node.name)) continue;
             line(
                     "JNATIVE_NOINLINE void "
                             + className(node.name).substring("::generated::".length())
@@ -1964,7 +2106,7 @@ public final class CppEmitter implements Opcodes {
         line("}");
     }
 
-    private void emitDispatchers(StringBuilder header, SupportSources support) {
+    private void declareDispatchers(StringBuilder header) {
         var calls = new LinkedHashSet<MethodId>();
         for(MethodId member : program.reflection().methods()) {
             if(member.name().equals("<init>")) continue;
@@ -1998,9 +2140,7 @@ public final class CppEmitter implements Opcodes {
                 }
             }
         }
-        var implementations = new ArrayList<>(program.instantiatedClasses());
         names.registerCalls(calls);
-        implementations.sort(Comparator.comparingInt(this::depth).reversed().thenComparing(s -> s));
         for(MethodId call : calls) {
             var parameters = new ArrayList<>(List.of("::jnative::Object* receiver"));
             for(Type t : Type.getArgumentTypes(call.descriptor())) parameters.add(type(t));
@@ -2011,13 +2151,17 @@ public final class CppEmitter implements Opcodes {
                     .append(String.join(", ", parameters))
                     .append(");\n");
         }
-        for(MethodId call : calls) {
+    }
+
+    private void emitDispatchers(SupportSources support,
+                                 Map<MethodId, ReadableMethodEmitter.Result> readable) {
+        var implementations = new ArrayList<>(program.instantiatedClasses());
+        implementations.sort(Comparator.comparingInt(this::depth).reversed().thenComparing(s -> s));
+        for(MethodId call : names.calls()) {
             Type[] arguments = Type.getArgumentTypes(call.descriptor());
             var parameters = new ArrayList<>(List.of("::jnative::Object* receiver"));
-            var args = new ArrayList<String>();
             for(int i = 0; i < arguments.length; ++i) {
                 parameters.add(type(arguments[i]) + " arg" + i);
-                args.add("arg" + i);
             }
             line(
                     type(Type.getReturnType(call.descriptor()))
@@ -2031,13 +2175,20 @@ public final class CppEmitter implements Opcodes {
                 String condition = bridge.owner().equals("java/lang/String")
                         ? "receiver->runtime_kind == ::jnative::RuntimeKind::string"
                         : "dynamic_cast<::jnative::FilePath*>(receiver)";
-                var bridgeArgs = new ArrayList<>(args);
+                line("    if (" + condition + ") {");
+                // Bridges adapt arguments before entering the helper. Keep their
+                // boundary protection independent of ordinary generated targets.
+                var protectedArguments = dispatchArguments(arguments, true, "        ");
+                var bridgeArgs = new ArrayList<>(protectedArguments.arguments());
                 if(call.owner().equals("java/lang/Comparable"))
-                    bridgeArgs.set(0, "::jnative::check_cast(arg0, \"" + bridge.owner() + "\")");
+                    bridgeArgs.set(0, "::jnative::check_cast(" + bridgeArgs.get(0)
+                            + ", \"" + bridge.owner() + "\")");
                 String expression = libraryCall(new MethodInsnNode(INVOKEVIRTUAL, bridge.owner(),
-                        bridge.name(), bridge.descriptor(), false), "receiver", bridgeArgs);
-                line("    if (" + condition + ") return " + expression + ";");
+                        bridge.name(), bridge.descriptor(), false), protectedArguments.receiver(), bridgeArgs);
+                line("        return " + expression + ";");
+                line("    }");
             }
+            var boundedTargets = new LinkedHashMap<MethodId, List<String>>();
             var targets = new LinkedHashMap<MethodId, List<String>>();
             for(String implementation : implementations) {
                 if(!subtype(implementation, call.owner())) continue;
@@ -2052,42 +2203,53 @@ public final class CppEmitter implements Opcodes {
                 if(!program.methods().containsKey(target)
                         || (program.methods().get(target).bytecode().access & ACC_ABSTRACT) != 0)
                     continue;
-                targets.computeIfAbsent(target, ignored -> new ArrayList<>()).add(implementation);
+                (methodEffects.bounded(target) ? boundedTargets : targets)
+                        .computeIfAbsent(target, ignored -> new ArrayList<>()).add(implementation);
             }
-            // Runtime-only calls have no generated override to select. Even an
-            // empty switch would otherwise evaluate the virtual metadata accessor.
-            if(targets.isEmpty() && boundedRuntimeIntrinsic(call)) boundedRuntimeCalls.add(call);
-            if(!targets.isEmpty()) {
+            // Keep small noncollecting dispatch independent of the number of
+            // classes sharing a collecting implementation. Adding a cold subtype
+            // must not force an indirect jump table for otherwise tiny leaf calls.
+            for(var group : List.of(boundedTargets, targets)) {
+                if(group.isEmpty()) continue;
                 line("    switch (receiver->type_id()) {");
-                for(var entry : targets.entrySet()) {
+                for(var entry : group.entrySet()) {
                     MethodId target = entry.getKey();
                     for(String implementation : entry.getValue())
                         line("        case " + className(implementation) + "::class_id:");
+                    line("        {");
+                    var protectedArguments = dispatchArguments(arguments,
+                            !targetProtectsArguments(target, readable), "            ");
+                    String receiver = protectedArguments.receiver();
+                    List<String> values = protectedArguments.arguments();
                     String invoke =
                             (program.classes().get(target.owner()).access & ACC_INTERFACE) != 0
                                     ? symbol(target)
-                                    + "(receiver"
-                                    + (args.isEmpty() ? "" : ", " + String.join(", ", args))
+                                    + "(" + receiver
+                                    + (values.isEmpty() ? "" : ", " + String.join(", ", values))
                                     + ")"
                                     : "static_cast<"
                                     + className(target.owner())
-                                    + "*>(receiver)->"
+                                    + "*>(" + receiver + ")->"
                                     + names.simpleName(target.owner())
                                     + "::"
                                     + memberName(target)
                                     + "("
-                                    + String.join(", ", args)
+                                    + String.join(", ", values)
                                     + ")";
                     line(
                             "            "
                                     + (Type.getReturnType(call.descriptor()).equals(Type.VOID_TYPE)
                                     ? invoke + "; return;"
                                     : "return " + invoke + ";"));
+                    line("        }");
                 }
                 line("        default: break;");
                 line("    }");
             }
             if(program.platform(call.owner())) {
+                PlatformBindings.Target binding = program.bindings().find(call);
+                var protectedArguments = dispatchArguments(arguments,
+                        binding == null || !targetProtectsArguments(binding.helper(), readable), "    ");
                 String fallback =
                         libraryCall(
                                 new MethodInsnNode(
@@ -2096,8 +2258,8 @@ public final class CppEmitter implements Opcodes {
                                         call.name(),
                                         call.descriptor(),
                                         false),
-                                "receiver",
-                                args);
+                                protectedArguments.receiver(),
+                                protectedArguments.arguments());
                 line(
                         "    "
                                 + (Type.getReturnType(call.descriptor()).equals(Type.VOID_TYPE)
@@ -2112,6 +2274,20 @@ public final class CppEmitter implements Opcodes {
         }
     }
 
+    private record DispatchArguments(String receiver, List<String> arguments) {}
+
+    /** Registration belongs to the selected branch, after noncollecting type selection. */
+    private DispatchArguments dispatchArguments(Type[] arguments, boolean rooted, String indent) {
+        if(rooted) line(indent + "::jnative::LocalRoot<> receiver_root(receiver);");
+        var values = new ArrayList<String>();
+        for(int i = 0; i < arguments.length; ++i) {
+            boolean root = rooted && reference(arguments[i]);
+            if(root) line(indent + "::jnative::LocalRoot<> arg" + i + "_root(arg" + i + ");");
+            values.add("arg" + i + (root ? "_root.get()" : ""));
+        }
+        return new DispatchArguments(rooted ? "receiver_root.get()" : "receiver", values);
+    }
+
     private void emitRuntimeAdapters(Map<String, String> sources, SupportSources support) {
         StringBuilder api = new StringBuilder("#pragma once\n#include \"jn_runtime.hpp\"\n\n");
         api.append(
@@ -2120,17 +2296,15 @@ public final class CppEmitter implements Opcodes {
                 .append("// and keep object arguments rooted while evaluating other arguments.\n");
         StringBuilder mapping = new StringBuilder("java-method\tcpp-call\n");
         for(MethodId call : names.calls()) {
-            boolean bounded =
-                    boundedRuntimeCalls.contains(call) || methodEffects.boundedDispatch(call);
             String name = names.call(call);
             int separator = name.lastIndexOf("::");
             String namespace = name.substring(2, separator), member = name.substring(separator + 2);
             Type[] arguments = Type.getArgumentTypes(call.descriptor());
             var parameters = new ArrayList<>(List.of("::jnative::Object* receiver"));
-            var values = new ArrayList<>(List.of(bounded ? "receiver" : "receiver_root.get()"));
+            var values = new ArrayList<>(List.of("receiver"));
             for(int i = 0; i < arguments.length; ++i) {
                 parameters.add(type(arguments[i]) + " arg" + i);
-                values.add("arg" + i + (!bounded && reference(arguments[i]) ? "_root.get()" : ""));
+                values.add("arg" + i);
             }
             String signature =
                     type(Type.getReturnType(call.descriptor()))
@@ -2146,17 +2320,7 @@ public final class CppEmitter implements Opcodes {
                     .append(closeNamespace(namespace));
             line(openNamespace(namespace));
             line(signature + " {");
-            if(bounded) {
-                // No managed allocation or poll on the successful path. Failure raises
-                // without using the receiver again; callers retain their existing roots.
-                line("    // All successful targets are bounded and noncollecting.");
-            }
-            else {
-                line("    ::jnative::LocalRoot<> receiver_root(receiver);");
-                for(int i = 0; i < arguments.length; ++i)
-                    if(reference(arguments[i]))
-                        line("    ::jnative::LocalRoot<> arg" + i + "_root(arg" + i + ");");
-            }
+            line("    // The selected dispatch branch protects arguments when its target cannot.");
             line(
                     "    return ::generated::"
                             + dispatchName(call)
@@ -2171,8 +2335,67 @@ public final class CppEmitter implements Opcodes {
         sources.put("java-api.tsv", mapping.toString());
     }
 
+    private boolean targetProtectsArguments(MethodId id,
+                                             Map<MethodId, ReadableMethodEmitter.Result> readable) {
+        Program.Method target = program.methods().get(id);
+        if(target == null || (target.bytecode().access & (ACC_ABSTRACT | ACC_SYNCHRONIZED)) != 0)
+            return false;
+        // emitManagedImport either publishes every reference before initialization,
+        // or delegates to its explicit managesRoots contract after the same audit.
+        if(target.nativeBinding() != null)
+            return target.nativeBinding().managed() && (target.bytecode().access & ACC_STATIC) != 0;
+        // Static substitution helpers can initialize their declaring class before
+        // entering a bounded body. Keep branch roots unless that prefix is trivial.
+        if(methodEffects.bounded(id) && ((target.bytecode().access & ACC_STATIC) == 0
+                || trivialManagedImportInitialization(id.owner(), new HashSet<>()))) return true;
+        ReadableMethodEmitter.Result body = readable.get(id);
+        return body != null && terminalArgumentProtection(body).protects();
+    }
+
     MethodId directTarget(MethodInsnNode call) {
         return callTargets.direct(call);
+    }
+
+    boolean preservesReferenceReads(MethodId caller, MethodInsnNode call) {
+        if(!boundedCall(caller, call) || call.name.startsWith("<")) return false;
+        MethodId target = call.getOpcode() == INVOKESTATIC || call.getOpcode() == INVOKESPECIAL
+                ? resolve(call.owner, call.name, call.desc) : directTarget(call);
+        if(target == null || program.platform(target.owner())) return false;
+        // A static entry may initialize its owner before the otherwise simple body.
+        if(call.getOpcode() == INVOKESTATIC && !emptyInitialization(target.owner())) return false;
+        return referencePreservingLeaves.computeIfAbsent(target, this::referencePreservingLeaf);
+    }
+
+    private boolean referencePreservingLeaf(MethodId id) {
+        Program.Method target = program.methods().get(id);
+        if(target == null || target.nativeSymbol() != null
+                || (target.bytecode().access & (ACC_NATIVE | ACC_SYNCHRONIZED | ACC_ABSTRACT)) != 0
+                || target.bytecode().instructions.size() > 256
+                || !target.bytecode().tryCatchBlocks.isEmpty()) return false;
+        for(AbstractInsnNode instruction : target.bytecode().instructions) {
+            int opcode = instruction.getOpcode();
+            if(instruction instanceof FieldInsnNode field) {
+                if(opcode != GETFIELD && opcode != PUTFIELD) return false;
+                if(opcode == PUTFIELD && reference(Type.getType(field.desc))) return false;
+                if(program.bindings().field(field.owner, field.name, field.desc) != null) return false;
+                String owner = fieldOwner(field.owner, field.name, field.desc);
+                ClassNode declaring = program.classes().get(owner);
+                if(declaring == null) return false;
+                FieldNode definition = declaring.fields.stream()
+                        .filter(candidate -> candidate.name.equals(field.name) && candidate.desc.equals(field.desc))
+                        .findFirst().orElse(null);
+                if(definition == null || (definition.access & ACC_VOLATILE) != 0) return false;
+            }
+            // No nested calls, allocation, publication, synchronization or array writes.
+            // Primitive field writes are allowed; callers invalidate those field reads.
+            else if(instruction instanceof MethodInsnNode || instruction instanceof InvokeDynamicInsnNode
+                    || instruction instanceof TypeInsnNode || instruction instanceof MultiANewArrayInsnNode
+                    || instruction instanceof LdcInsnNode constant && !(constant.cst instanceof Number)
+                    || opcode >= IASTORE && opcode <= SASTORE
+                    || opcode == NEWARRAY || opcode == MONITORENTER || opcode == MONITOREXIT
+                    || opcode == ATHROW) return false;
+        }
+        return true;
     }
 
     boolean boundedRuntimeCall(MethodInsnNode call) {
@@ -2339,6 +2562,7 @@ public final class CppEmitter implements Opcodes {
         return inlineInitializedEntries.contains(id);
     }
 
+
     boolean initializedCopyBoundary(MethodId id) {
         return initializedEntries.contains(id) && !inlineInitializedEntries.contains(id);
     }
@@ -2355,7 +2579,34 @@ public final class CppEmitter implements Opcodes {
     }
 
     boolean protectsCallArguments(MethodInsnNode call) {
-        return methodEffects != null && methodEffects.protectsCallArguments(call);
+        if(methodEffects == null) return false;
+        // This is a stable dispatch-boundary contract, not a speculative
+        // certificate for the currently selected Java implementation.
+        if(protectsDispatchArguments(call)) return true;
+        if(methodEffects.protectsCallArguments(call)) return true;
+        MethodId target = call.getOpcode() == INVOKESTATIC || call.getOpcode() == INVOKESPECIAL
+                ? resolve(call.owner, call.name, call.desc) : directTarget(call);
+        return target != null && methodEffects.protectsNativeTailArguments(target);
+    }
+
+    /** Stable boundary contracts, independent of optional caller/callee lowering. */
+    boolean protectsLastUseEntryCall(MethodInsnNode call) {
+        if(protectsDispatchArguments(call)) return true;
+        if(program.platform(call.owner) || RuntimeLibrary.intrinsic(call.owner, call.name, call.desc)) return false;
+        MethodId target = call.getOpcode() == INVOKESTATIC || call.getOpcode() == INVOKESPECIAL
+                ? resolve(call.owner, call.name, call.desc) : directTarget(call);
+        if(target == null) return false;
+        Program.Method method = program.methods().get(target);
+        return method != null && method.nativeBinding() != null
+                && method.nativeBinding().runtimeOnly() && method.nativeBinding().managesRoots()
+                && targetProtectsArguments(target, Map.of());
+    }
+
+    /** This lowering always enters the dispatcher, whose selected branch owns protection. */
+    boolean protectsDispatchArguments(MethodInsnNode call) {
+        return (call.getOpcode() == INVOKEVIRTUAL || call.getOpcode() == INVOKEINTERFACE)
+                && program.platform(call.owner) && !call.owner.equals("java/lang/String")
+                && !call.name.equals("<init>") && !boundedRuntimeCall(call);
     }
 
     MethodEffects.Summary cooperativeWork(MethodId method, Set<AbstractInsnNode> scoped) {
@@ -2404,12 +2655,29 @@ public final class CppEmitter implements Opcodes {
         return methodEffects.initializationDependencies(method);
     }
 
+    boolean emptyInitialization(String owner) {
+        return classInitializationEffects.empty(owner);
+    }
+
     boolean returnsThrough(MethodId method, AbstractInsnNode instruction) {
         return methodEffects.returnsThrough(method, instruction);
     }
 
     Set<AbstractInsnNode> ownedArrayInstructions(MethodId method) {
         return ownedArrays.instructions(method);
+    }
+
+    Set<AbstractInsnNode> confinedArrayInstructions(Program.Method method) {
+        return ConfinedArrays.analyze(method.id().owner(), method.bytecode(), arrayBorrowing);
+    }
+
+    ArrayStorage.Facts arrayStorage(Program.Method method, Set<AbstractInsnNode> confined) {
+        return ArrayStorage.facts(method.id().owner(), method.bytecode(), confined, ownedArrays,
+                arrayInputs.getOrDefault(method.id(), List.of()));
+    }
+
+    boolean boundedReferenceStore(MethodId method, AbstractInsnNode instruction) {
+        return referenceStores.bounded(method, instruction);
     }
 
     private String primitiveArrayStorage(String descriptor) {
@@ -2421,7 +2689,7 @@ public final class CppEmitter implements Opcodes {
     }
 
     boolean boundedIntrinsic(MethodInsnNode call) {
-        if(boundedRuntimeCall(call) || call.getOpcode() == INVOKESTATIC
+        if(boundedRuntimeCall(call) || (call.getOpcode() == INVOKESTATIC || call.getOpcode() == INVOKESPECIAL)
                 && boundedRuntimeIntrinsic(new MethodId(call.owner, call.name, call.desc))) return true;
         if(call.getOpcode() == INVOKESTATIC && !program.platform(call.owner)) {
             MethodId id = resolve(call.owner, call.name, call.desc);

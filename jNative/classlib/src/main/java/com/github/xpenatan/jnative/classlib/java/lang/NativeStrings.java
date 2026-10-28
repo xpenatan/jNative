@@ -25,7 +25,7 @@ public final class NativeStrings {
         return indexOf(text, value, 0);
     }
 
-    @NativeImport(value = "jnative::string_index_of_code_point", managed = true, runtimeOnly = true)
+    @NativeImport(value = "jnative::string_index_of_code_point", managed = true, runtimeOnly = true, managesRoots = true)
     @SubstituteMethod(owner = "java.lang.String", name = "indexOf", descriptor = "(II)I")
     public static native int indexOf(String text, int value, int start);
 
@@ -34,7 +34,7 @@ public final class NativeStrings {
         return indexOf(text, part, 0);
     }
 
-    @NativeImport(value = "jnative::string_index_of_text", managed = true, runtimeOnly = true)
+    @NativeImport(value = "jnative::string_index_of_text", managed = true, runtimeOnly = true, managesRoots = true)
     @SubstituteMethod(owner = "java.lang.String", name = "indexOf", descriptor = "(Ljava/lang/String;I)I")
     public static native int indexOf(String text, String part, int start);
 
@@ -43,7 +43,7 @@ public final class NativeStrings {
         return lastIndexOf(text, value, text.length() - 1);
     }
 
-    @NativeImport(value = "jnative::string_last_index_of_code_point", managed = true, runtimeOnly = true)
+    @NativeImport(value = "jnative::string_last_index_of_code_point", managed = true, runtimeOnly = true, managesRoots = true)
     @SubstituteMethod(owner = "java.lang.String", name = "lastIndexOf", descriptor = "(II)I")
     public static native int lastIndexOf(String text, int value, int start);
 
@@ -52,7 +52,7 @@ public final class NativeStrings {
         return startsWith(text, prefix, 0);
     }
 
-    @NativeImport(value = "jnative::string_starts_with", managed = true, runtimeOnly = true)
+    @NativeImport(value = "jnative::string_starts_with", managed = true, runtimeOnly = true, managesRoots = true)
     @SubstituteMethod(owner = "java.lang.String", name = "startsWith", descriptor = "(Ljava/lang/String;I)Z")
     public static native boolean startsWith(String text, String prefix, int offset);
 
