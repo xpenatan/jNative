@@ -58,19 +58,23 @@ public final class CppEmitter implements Opcodes {
     private CppNames names;
     private MethodEffects methodEffects;
     private ClassInitializationEffects classInitializationEffects;
+    private final Map<MethodId, Optional<PrimitiveInline>> primitiveInlines = new HashMap<>();
     private CallTargets callTargets;
+    private HeapEffects heapEffects;
+    private PrimitiveCopyCounts primitiveCopyCounts;
     private OwnedArrays ownedArrays;
     private Map<MethodId, List<ArrayStorage.Mode>> arrayInputs;
     private ArrayBorrowing arrayBorrowing;
     private ReferenceStores referenceStores;
     private Set<MethodId> initializedEntries = Set.of();
     private Set<MethodId> inlineInitializedEntries = Set.of();
+    private Set<MethodId> initializedDependencyEntries = Set.of();
+    private InliningPlan inliningPlan = InliningPlan.EMPTY;
     private Set<MethodId> protectedCallbackTargets = Set.of();
     private final Map<String, Integer> classIds = new HashMap<>();
     private final Map<String, Integer> stringLiterals = new LinkedHashMap<>();
     private final Map<String, Integer> classLiterals = new LinkedHashMap<>();
     private final Map<MethodId, Boolean> boundedRuntimeEffects = new HashMap<>();
-    private final Map<MethodId, Boolean> referencePreservingLeaves = new HashMap<>();
     private boolean readableLibraryCalls;
     private final List<ReadabilityFallback> readabilityFallbacks = new ArrayList<>();
     private static final MethodId TO_STRING =
@@ -93,19 +97,24 @@ public final class CppEmitter implements Opcodes {
                 ? Map.<MethodId, SubstitutionRegistry.MethodOrigin>of() : program.substitutions().methodOrigins();
         this.names = new CppNames(program, request.sourceLayout());
         this.callTargets = new CallTargets(program);
+        this.primitiveCopyCounts = new PrimitiveCopyCounts(program,
+                call -> verifiedArraycopy(call) && !smallConstantCopy(call), this::directGeneratedTarget);
         this.arrayBorrowing = new ArrayBorrowing(program);
         this.ownedArrays = new OwnedArrays(program, arrayBorrowing);
         this.arrayInputs = ArrayStorage.inputs(program, ownedArrays, arrayBorrowing);
         this.referenceStores = new ReferenceStores(program, ownedArrays);
         this.classInitializationEffects = new ClassInitializationEffects(program);
+        this.heapEffects = new HeapEffects(program, this::directGeneratedTarget);
+        primitiveInlines.clear();
         initializedEntries = Set.of();
         inlineInitializedEntries = Set.of();
+        initializedDependencyEntries = Set.of();
+        inliningPlan = InliningPlan.EMPTY;
         protectedCallbackTargets = Set.of();
         classIds.clear();
         stringLiterals.clear();
         classLiterals.clear();
         boundedRuntimeEffects.clear();
-        referencePreservingLeaves.clear();
         for(String owner : new TreeSet<>(program.classes().keySet()))
             classIds.put(owner, classIds.size() + 1);
         this.out = new StringBuilder();
@@ -182,6 +191,8 @@ public final class CppEmitter implements Opcodes {
         }
         imports.append("#ifdef __cplusplus\n}\n#endif\n#endif\n");
         sources.put("jnative_imports.h", imports.toString());
+        String inlinePreamble = out.toString();
+        if(!request.stackTraces().javaFrames()) line("#include \"" + InliningPlan.FILE + "\"");
         String preamble = out.toString();
         SupportSources support = new SupportSources(sources, preamble);
         StringBuilder mappings =
@@ -189,6 +200,7 @@ public final class CppEmitter implements Opcodes {
         StringBuilder readability = new StringBuilder("java-method\tform\tdetail\n");
         Map<MethodId, Map<String, Object>> methodMappings = new LinkedHashMap<>();
         Map<MethodId, Map<String, Object>> initializedMappings = new LinkedHashMap<>();
+        Map<MethodId, Map<String, Object>> inlineMappings = new LinkedHashMap<>();
         line("\nnamespace generated {");
         header.append("void initialize_program();\n");
         int registeredTypes = 0;
@@ -265,7 +277,12 @@ public final class CppEmitter implements Opcodes {
                 methodEffects.validatedArgumentProtection(id, readable.protectsArguments());
         });
         Set<MethodId> tailLowerings = methodEffects.tailLowerings();
-        initializedEntries = initializedEntryTargets(validatedReadable);
+        initializedDependencyEntries = initializedDependencyTargets(validatedReadable);
+        Set<MethodId> entries = new HashSet<>(initializedEntryTargets(validatedReadable));
+        entries.addAll(initializedDependencyEntries);
+        initializedEntries = Set.copyOf(entries);
+        inliningPlan = InliningPlan.analyze(program, request, initializedEntries,
+                methodEffects::boundedAfterInitialization);
         inlineInitializedEntries = inlineInitializedEntryTargets(initializedEntries);
         names.registerInitializedMethods(program, initializedEntries);
         Map<MethodId, ReadableMethodEmitter.Result> finalizedReadable = new HashMap<>();
@@ -308,8 +325,10 @@ public final class CppEmitter implements Opcodes {
                 initializedArgumentProtection.put(id, terminalArgumentProtection(readable)));
         initializedLoweringFailed |= !methodEffects.tailArgumentsProtected(initializedArgumentProtection);
         if(initializedLoweringFailed) {
+            inliningPlan = InliningPlan.EMPTY;
             initializedEntries = Set.of();
             inlineInitializedEntries = Set.of();
+            initializedDependencyEntries = Set.of();
             names.registerInitializedMethods(program, initializedEntries);
             initializedReadable.clear();
             for(Program.Method candidate : program.methods().values()) {
@@ -323,6 +342,33 @@ public final class CppEmitter implements Opcodes {
                         : new ReadableMethodEmitter(this, program, names, request, candidate).emit());
             }
         }
+        inliningPlan = inliningPlan.withImplementations(program, request, finalizedReadable,
+                initializedEntries, methodEffects::boundedAfterInitialization, this::directGeneratedTarget);
+        names.registerInlineMethods(program, inliningPlan.implementations());
+        if(!inliningPlan.implementations().isEmpty()) {
+            Map<MethodId, ReadableMethodEmitter.Result> withImplementations = new HashMap<>();
+            Map<MethodId, ReadableMethodEmitter.Result> initializedWithImplementations = new HashMap<>();
+            boolean valid = true;
+            for(var candidate : program.methods().values()) {
+                var previous = finalizedReadable.get(candidate.id());
+                if(previous == null || previous.source() == null) continue;
+                var revised = new ReadableMethodEmitter(this, program, names, request, candidate).emit();
+                valid &= sameLoweringContract(previous, revised);
+                withImplementations.put(candidate.id(), revised);
+                if(initializedReadable.containsKey(candidate.id())) {
+                    var initialized = new ReadableMethodEmitter(this, program, names, request, candidate, true).emit();
+                    valid &= sameLoweringContract(initializedReadable.get(candidate.id()), initialized);
+                    initializedWithImplementations.put(candidate.id(), initialized);
+                }
+            }
+            if(valid) {
+                finalizedReadable.putAll(withImplementations);
+                initializedReadable.putAll(initializedWithImplementations);
+            } else {
+                inliningPlan = new InliningPlan(inliningPlan.sharedBodies(), Set.of());
+                names.registerInlineMethods(program, Set.of());
+            }
+        }
         Set<MethodId> callbackTargets = new HashSet<>();
         for(MethodId id : program.methods().keySet())
             if(targetProtectsArguments(id, finalizedReadable)) callbackTargets.add(id);
@@ -334,7 +380,11 @@ public final class CppEmitter implements Opcodes {
         line("}\n");
         emitRuntimeAdapters(sources, support);
         support.finish(out);
+        StringBuilder inlineBodies = new StringBuilder("#pragma once\n").append(inlinePreamble);
+        int inlineOffset = 0;
+        int inlineLine = 1;
         for(ClassNode owner : program.classes().values()) {
+            boolean inlineNamespace = false;
             String path = names.path(owner.name) + ".cpp";
             out =
                     new StringBuilder(sources.getOrDefault(path, preamble))
@@ -371,7 +421,8 @@ public final class CppEmitter implements Opcodes {
                     ReadableMethodEmitter.Result readable =
                             finalizedReadable.get(current.id());
                     if(readable.source() != null) {
-                        out.append(readable.source());
+                        if(inliningPlan.implementation(current.id())) emitImplementationWrapper(current);
+                        else out.append(readable.source());
                         readability
                                 .append(tableText(current.id().toString()))
                                 .append("\tstructured\t\n");
@@ -424,34 +475,62 @@ public final class CppEmitter implements Opcodes {
                         .append('\t')
                         .append(tableText(owner.sourceFile == null ? "" : owner.sourceFile))
                         .append('\n');
-                ReadableMethodEmitter.Result initialized = initializedReadable.get(current.id());
+                boolean implementation = inliningPlan.implementation(current.id());
+                ReadableMethodEmitter.Result initialized = implementation
+                        ? finalizedReadable.get(current.id()) : initializedReadable.get(current.id());
                 if(initialized != null) {
-                    int initializedFirstLine = sourceLine;
-                    out.append(initialized.source());
-                    while(sourceOffset < out.length())
-                        if(out.charAt(sourceOffset++) == '\n') sourceLine++;
+                    boolean shared = implementation || inliningPlan.shared(current.id());
+                    String entryMethod = implementation ? names.inlineMethod(current.id())
+                            : names.initializedMethod(current.id());
+                    int initializedFirstLine;
+                    int initializedLastLine;
+                    String initializedPath;
+                    if(shared) {
+                        if(!inlineNamespace) {
+                            inlineBodies.append('\n').append(openNamespace(names.namespace(owner.name)));
+                            inlineNamespace = true;
+                        }
+                        while(inlineOffset < inlineBodies.length())
+                            if(inlineBodies.charAt(inlineOffset++) == '\n') inlineLine++;
+                        initializedFirstLine = inlineLine;
+                        inlineBodies.append(initialized.source());
+                        while(inlineOffset < inlineBodies.length())
+                            if(inlineBodies.charAt(inlineOffset++) == '\n') inlineLine++;
+                        initializedLastLine = inlineLine - 1;
+                        initializedPath = InliningPlan.FILE;
+                    } else {
+                        initializedFirstLine = sourceLine;
+                        out.append(initialized.source());
+                        while(sourceOffset < out.length())
+                            if(out.charAt(sourceOffset++) == '\n') sourceLine++;
+                        initializedLastLine = sourceLine - 1;
+                        initializedPath = path;
+                    }
                     var mapping = new LinkedHashMap<String, Object>();
                     mapping.put("javaMethod", current.id().toString());
-                    mapping.put("cppMethod", names.initializedMethod(current.id()));
+                    mapping.put("cppMethod", entryMethod);
                     mapping.put("cppLineStart", initializedFirstLine);
-                    mapping.put("cppLineEnd", sourceLine - 1);
-                    mapping.put("entry", "initialized");
+                    mapping.put("cppLineEnd", initializedLastLine);
+                    mapping.put("entry", implementation ? "implementation" : "initialized");
                     if(methodMappings.get(current.id()).containsKey("substitution"))
                         mapping.put("substitution", methodMappings.get(current.id()).get("substitution"));
-                    initializedMappings.put(current.id(), mapping);
+                    if(shared) inlineMappings.put(current.id(), mapping);
+                    else initializedMappings.put(current.id(), mapping);
                     mappings.append(tableText(current.id().toString())).append('\t')
                             .append(className(owner.name)).append("::")
-                            .append(names.initializedMethod(current.id())).append('\t')
-                            .append(path).append('\t')
+                            .append(entryMethod).append('\t')
+                            .append(initializedPath).append('\t')
                             .append(tableText(owner.sourceFile == null ? "" : owner.sourceFile)).append('\n');
                     readability.append(tableText(current.id().toString()))
-                            .append("\tstructured-initialized\t")
-                            .append(names.initializedMethod(current.id())).append('\n');
+                            .append(implementation ? "\tstructured-implementation\t" : "\tstructured-initialized\t")
+                            .append(entryMethod).append('\n');
                 }
             }
             line(closeNamespace(names.namespace(owner.name)));
             sources.put(path, out.toString());
+            if(inlineNamespace) inlineBodies.append(closeNamespace(names.namespace(owner.name)));
         }
+        if(!request.stackTraces().javaFrames()) sources.put(InliningPlan.FILE, inlineBodies.toString());
         out = new StringBuilder(preamble);
         header.append("void invoke_main(::jnative::Object* arguments);\n");
         int literalSlots = Math.max(1, stringLiterals.size());
@@ -550,6 +629,7 @@ public final class CppEmitter implements Opcodes {
         sources.put("java-symbols.tsv", mappings.toString());
         sources.put("source-readability.tsv", readability.toString());
         sources.put("call-targets.tsv", callTargets.report());
+        sources.put("heap-effects.tsv", heapEffects.report());
         StringBuilder registrations = new StringBuilder("kind\tclass\tmember\tdescriptor\n");
         for(var registration : request.reflection())
             registrations
@@ -621,6 +701,17 @@ public final class CppEmitter implements Opcodes {
                             .toList());
             sourceMap.add(entry);
         }
+        List<Map<String, Object>> inlineClasses = new ArrayList<>();
+        String inlineHash = inlineMappings.isEmpty() ? "" : contentHash(sources.get(InliningPlan.FILE));
+        for(ClassNode owner : program.classes().values()) {
+            List<Map<String, Object>> methods = inlineMappings.entrySet().stream()
+                    .filter(entry -> entry.getKey().owner().equals(owner.name))
+                    .map(Map.Entry::getValue).toList();
+            if(methods.isEmpty()) continue;
+            inlineClasses.add(Map.of("javaClass", owner.name.replace('/', '.'),
+                    "cppClass", names.className(owner.name), "cppFile", InliningPlan.FILE,
+                    "sha256", inlineHash, "methods", methods));
+        }
         sources.put(
                 "source-map.json",
                 Json.write(
@@ -630,13 +721,37 @@ public final class CppEmitter implements Opcodes {
                                 "layout",
                                 request.sourceLayout().name(),
                                 "classes",
-                                sourceMap))
+                                sourceMap,
+                                "inlineClasses",
+                                inlineClasses))
                         + "\n");
         return sources;
     }
 
     public List<ReadabilityFallback> readabilityFallbacks() {
         return List.copyOf(readabilityFallbacks);
+    }
+
+    private static boolean sameLoweringContract(ReadableMethodEmitter.Result previous,
+            ReadableMethodEmitter.Result revised) {
+        return revised.source() != null
+                && (!previous.protectsArguments() || revised.protectsArguments())
+                && (!previous.protectsEntryArguments() || revised.protectsEntryArguments())
+                && (!previous.protectsTerminalArguments() || revised.protectsTerminalArguments())
+                && (previous.cooperativeWork() == null || previous.cooperativeWork().equals(revised.cooperativeWork()));
+    }
+
+    boolean inlineImplementation(MethodId method) {
+        return inliningPlan.implementation(method);
+    }
+
+    private void emitImplementationWrapper(Program.Method current) {
+        List<String> arguments = new ArrayList<>();
+        for(int i = 0; i < Type.getArgumentTypes(current.id().descriptor()).length; i++)
+            arguments.add("arg" + i);
+        line(memberSignature(current, true) + " {");
+        line("    return " + names.inlineMethod(current.id()) + "(" + String.join(", ", arguments) + ");");
+        line("}\n");
     }
 
     private void emitMethod() {
@@ -1834,10 +1949,16 @@ public final class CppEmitter implements Opcodes {
                         .append(')')
                         .append(abstractMethod ? " = 0;\n" : ";\n");
                 if(initializedEntries.contains(m.id()))
-                    declaration.append("    static ")
-                            .append(inlineInitializedEntry(m.id()) ? "JNATIVE_INLINE_ENTRY " : "")
+                    declaration.append((m.bytecode().access & ACC_STATIC) != 0 ? "    static " : "    ")
+                            .append(initializedEntryQualifier(m.id()))
                             .append(type(Type.getReturnType(m.id().descriptor()))).append(' ')
                             .append(names.initializedMethod(m.id())).append('(')
+                            .append(sourceParameters(m)).append(");\n");
+                if(inliningPlan.implementation(m.id()))
+                    declaration.append((m.bytecode().access & ACC_STATIC) != 0 ? "    static " : "    ")
+                            .append("JNATIVE_FORCEINLINE ")
+                            .append(type(Type.getReturnType(m.id().descriptor()))).append(' ')
+                            .append(names.inlineMethod(m.id())).append('(')
                             .append(sourceParameters(m)).append(");\n");
                 if(m.id().name().equals("<init>")
                         && (node.access & (ACC_ABSTRACT | ACC_INTERFACE)) == 0)
@@ -2356,46 +2477,45 @@ public final class CppEmitter implements Opcodes {
         return callTargets.direct(call);
     }
 
-    boolean preservesReferenceReads(MethodId caller, MethodInsnNode call) {
-        if(!boundedCall(caller, call) || call.name.startsWith("<")) return false;
-        MethodId target = call.getOpcode() == INVOKESTATIC || call.getOpcode() == INVOKESPECIAL
-                ? resolve(call.owner, call.name, call.desc) : directTarget(call);
-        if(target == null || program.platform(target.owner())) return false;
-        // A static entry may initialize its owner before the otherwise simple body.
-        if(call.getOpcode() == INVOKESTATIC && !emptyInitialization(target.owner())) return false;
-        return referencePreservingLeaves.computeIfAbsent(target, this::referencePreservingLeaf);
+    PrimitiveInline primitiveInline(MethodId target) {
+        return primitiveInlines.computeIfAbsent(target,
+                id -> Optional.ofNullable(PrimitiveInline.analyze(program.methods().get(id)))).orElse(null);
     }
 
-    private boolean referencePreservingLeaf(MethodId id) {
-        Program.Method target = program.methods().get(id);
-        if(target == null || target.nativeSymbol() != null
-                || (target.bytecode().access & (ACC_NATIVE | ACC_SYNCHRONIZED | ACC_ABSTRACT)) != 0
-                || target.bytecode().instructions.size() > 256
-                || !target.bytecode().tryCatchBlocks.isEmpty()) return false;
-        for(AbstractInsnNode instruction : target.bytecode().instructions) {
-            int opcode = instruction.getOpcode();
-            if(instruction instanceof FieldInsnNode field) {
-                if(opcode != GETFIELD && opcode != PUTFIELD) return false;
-                if(opcode == PUTFIELD && reference(Type.getType(field.desc))) return false;
-                if(program.bindings().field(field.owner, field.name, field.desc) != null) return false;
-                String owner = fieldOwner(field.owner, field.name, field.desc);
-                ClassNode declaring = program.classes().get(owner);
-                if(declaring == null) return false;
-                FieldNode definition = declaring.fields.stream()
-                        .filter(candidate -> candidate.name.equals(field.name) && candidate.desc.equals(field.desc))
-                        .findFirst().orElse(null);
-                if(definition == null || (definition.access & ACC_VOLATILE) != 0) return false;
-            }
-            // No nested calls, allocation, publication, synchronization or array writes.
-            // Primitive field writes are allowed; callers invalidate those field reads.
-            else if(instruction instanceof MethodInsnNode || instruction instanceof InvokeDynamicInsnNode
-                    || instruction instanceof TypeInsnNode || instruction instanceof MultiANewArrayInsnNode
-                    || instruction instanceof LdcInsnNode constant && !(constant.cst instanceof Number)
-                    || opcode >= IASTORE && opcode <= SASTORE
-                    || opcode == NEWARRAY || opcode == MONITORENTER || opcode == MONITOREXIT
-                    || opcode == ATHROW) return false;
+    String inlineBoundedNative(MethodId target, List<String> arguments) {
+        Program.Method method = program.methods().get(target);
+        NativeBinding binding = method == null ? null : method.nativeBinding();
+        if(binding == null || !binding.managed() || !binding.runtimeOnly() || !binding.bounded()
+                || !binding.callbacks().isEmpty() || !binding.fields().isEmpty() || !binding.types().isEmpty()
+                || (method.bytecode().access & ACC_SYNCHRONIZED) != 0 || !emptyInitialization(target.owner()))
+            return null;
+        Type result = Type.getReturnType(target.descriptor());
+        if(reference(result)) return null;
+        List<String> parameters = new ArrayList<>();
+        List<String> values = new ArrayList<>();
+        for(Type parameter : Type.getArgumentTypes(target.descriptor())) {
+            if(reference(parameter)) return null;
+            String name = "native_arg" + parameters.size();
+            parameters.add(type(parameter) + " " + name);
+            values.add(name);
         }
-        return true;
+        return "::jnative::invoke_bounded_native([](" + String.join(", ", parameters) + ") -> "
+                + type(result) + " { return ::" + binding.symbol() + "(" + String.join(", ", values)
+                + "); }" + (arguments.isEmpty() ? "" : ", " + String.join(", ", arguments)) + ")";
+    }
+
+    HeapEffects.Summary heapEffects(MethodId caller, MethodInsnNode call, Set<String> initialized) {
+        if(call.name.startsWith("<")) return HeapEffects.Summary.UNKNOWN;
+        MethodId target = directGeneratedTarget(call);
+        if(target == null) return HeapEffects.Summary.UNKNOWN;
+        boolean proven = boundedCall(caller, call)
+                || initializedCall(caller, call, target, initialized)
+                && methodEffects.boundedAfterInitialization(target);
+        if(!proven || call.getOpcode() == INVOKESTATIC
+                && !emptyInitialization(target.owner()) && !initialized.contains(target.owner())
+                && !((program.methods().get(caller).bytecode().access & ACC_STATIC) != 0
+                && caller.owner().equals(target.owner()))) return HeapEffects.Summary.UNKNOWN;
+        return heapEffects.call(call);
     }
 
     boolean boundedRuntimeCall(MethodInsnNode call) {
@@ -2536,20 +2656,87 @@ public final class CppEmitter implements Opcodes {
         return Set.copyOf(called);
     }
 
-    boolean initializedCall(MethodId caller, MethodInsnNode call, MethodId declaration) {
-        return call.getOpcode() == INVOKESTATIC && initializedEntries.contains(declaration)
-                && caller.owner().equals(declaration.owner())
+    private Set<MethodId> initializedDependencyTargets(
+            Map<MethodId, ReadableMethodEmitter.Result> validatedReadable) {
+        Set<MethodId> bounded = new HashSet<>();
+        for(Program.Method target : program.methods().values()) {
+            var readable = validatedReadable.get(target.id());
+            var bytecode = target.bytecode();
+            if(readable == null || readable.source() == null || target.nativeSymbol() != null
+                    || readable.source().length() > 32768 || (bytecode.access & ACC_SYNCHRONIZED) != 0
+                    || target.id().name().startsWith("<") || isInterface(target.id().owner())
+                    || !bytecode.tryCatchBlocks.isEmpty()
+                    || !methodEffects.boundedAfterInitialization(target.id())
+                    || initializationDependencies(target.id()).isEmpty())
+                continue;
+            bounded.add(target.id());
+        }
+        Set<MethodId> called = new HashSet<>();
+        for(Program.Method caller : program.methods().values()) {
+            Set<String> initialized = methodEffects.delegatesRoots(caller.id())
+                    ? delegationInitializationDependencies(caller.id()) : initializationDependencies(caller.id());
+            if(initialized.isEmpty()) continue;
+            for(AbstractInsnNode instruction : caller.bytecode().instructions) {
+                if(!(instruction instanceof MethodInsnNode call)) continue;
+                MethodId target = directGeneratedTarget(call);
+                if(bounded.contains(target) && initialized.containsAll(initializedEntryDependencies(target)))
+                    called.add(target);
+            }
+        }
+        return Set.copyOf(called);
+    }
+
+    boolean initializedDependencyEntry(MethodId method) {
+        return initializedDependencyEntries.contains(method);
+    }
+
+    private Set<String> initializedEntryDependencies(MethodId method) {
+        Set<String> required = initializationDependencies(method);
+        if((program.methods().get(method).bytecode().access & ACC_STATIC) == 0
+                || emptyInitialization(method.owner())) return required;
+        Set<String> withOwner = new HashSet<>(required);
+        withOwner.add(method.owner());
+        return Set.copyOf(withOwner);
+    }
+
+    boolean initializedCall(MethodId caller, MethodInsnNode call, MethodId declaration,
+                            Set<String> initialized) {
+        if(!initializedEntries.contains(declaration)) return false;
+        if(initializedDependencyEntry(declaration))
+            return initialized.containsAll(initializedEntryDependencies(declaration));
+        return call.getOpcode() == INVOKESTATIC && caller.owner().equals(declaration.owner())
                 && (program.methods().get(caller).bytecode().access & ACC_STATIC) != 0;
     }
 
     private Set<MethodId> inlineInitializedEntryTargets(Set<MethodId> candidates) {
-        // Only initializedCall emits calls to these internal entries. Its exact
-        // owner rule keeps their callers and definitions in the same class source.
         Set<MethodId> result = new HashSet<>(candidates);
+        // Dependency entries can be selected by a guarded caller in another
+        // translation unit. Keep external linkage wherever that is possible.
+        for(Program.Method caller : program.methods().values()) {
+            Set<String> initialized = initializationDependencies(caller.id());
+            Set<String> delegated = delegationInitializationDependencies(caller.id());
+            if(initialized.isEmpty() && delegated.isEmpty()) continue;
+            for(AbstractInsnNode instruction : caller.bytecode().instructions) {
+                if(!(instruction instanceof MethodInsnNode call)) continue;
+                MethodId target = directGeneratedTarget(call);
+                if(target == null || target.owner().equals(caller.id().owner())
+                        || !initializedDependencyEntries.contains(target)) continue;
+                Set<String> required = initializedEntryDependencies(target);
+                if(initialized.containsAll(required) || delegated.containsAll(required)) result.remove(target);
+            }
+        }
+        // Dependency variants have a larger eligibility budget than the
+        // original internal entries. Limit forced expansion of their bodies.
+        for(MethodId id : initializedDependencyEntries) {
+            int operations = 0;
+            for(AbstractInsnNode instruction : program.methods().get(id).bytecode().instructions)
+                if(instruction.getOpcode() >= 0) operations++;
+            if(operations > 256) result.remove(id);
+        }
         for(MethodId id : candidates)
             for(AbstractInsnNode instruction : program.methods().get(id).bytecode().instructions)
                 if(instruction instanceof MethodInsnNode call && boundedArraycopy(call)
-                        && constantCopyCount(call) <= 32) {
+                        && trailingIntLiteral(call) <= 32) {
                     // Fixed payload expansion can multiply code in every caller.
                     // Reuse the intrinsic/count proof, including its binding identity.
                     result.remove(id);
@@ -2558,8 +2745,9 @@ public final class CppEmitter implements Opcodes {
         return Set.copyOf(result);
     }
 
-    boolean inlineInitializedEntry(MethodId id) {
-        return inlineInitializedEntries.contains(id);
+    String initializedEntryQualifier(MethodId id) {
+        if(inliningPlan.shared(id)) return "JNATIVE_FORCEINLINE ";
+        return inlineInitializedEntries.contains(id) ? "JNATIVE_INLINE_ENTRY " : "";
     }
 
 
@@ -2667,8 +2855,8 @@ public final class CppEmitter implements Opcodes {
         return ownedArrays.instructions(method);
     }
 
-    Set<AbstractInsnNode> confinedArrayInstructions(Program.Method method) {
-        return ConfinedArrays.analyze(method.id().owner(), method.bytecode(), arrayBorrowing);
+    ConfinedArrays.Facts confinedArrayFacts(Program.Method method) {
+        return ConfinedArrays.facts(method.id().owner(), method.bytecode(), arrayBorrowing);
     }
 
     ArrayStorage.Facts arrayStorage(Program.Method method, Set<AbstractInsnNode> confined) {
@@ -2728,6 +2916,12 @@ public final class CppEmitter implements Opcodes {
         return verifiedArraycopy(call) && smallConstantCopy(call);
     }
 
+    PackedFloatCopy packedFloatCopy(Program.Method method) {
+        return method != null && method.id().descriptor().startsWith("([FI[FI")
+                && emptyInitialization(method.id().owner())
+                ? PackedFloatCopy.match(program, method, this::verifiedArraycopy) : null;
+    }
+
     private boolean verifiedArraycopy(MethodInsnNode call) {
         if(call.getOpcode() != INVOKESTATIC || !call.owner.equals("java/lang/System")
                 || !call.name.equals("arraycopy") || !call.desc.equals("(Ljava/lang/Object;ILjava/lang/Object;II)V")) return false;
@@ -2739,7 +2933,15 @@ public final class CppEmitter implements Opcodes {
                 && NativeBinding.trivialInitialization(program.classes().get(target.helper().owner()));
     }
 
-    record GuardedPrimitiveCopy(String fast, String slow) {
+    private MethodId directGeneratedTarget(MethodInsnNode call) {
+        if(program.platform(call.owner)) return null;
+        return switch(call.getOpcode()) {
+            case INVOKESTATIC, INVOKESPECIAL -> resolve(call.owner, call.name, call.desc);
+            default -> directTarget(call);
+        };
+    }
+
+    record GuardedPrimitiveCopy(String fast, String slow, int preferredCount, String fixed) {
     }
 
     /** Separate arms only for the verified adapter and equal, precise primitive array kinds. */
@@ -2754,10 +2956,15 @@ public final class CppEmitter implements Opcodes {
         if(element == null) return null;
         PlatformBindings.Target target = program.bindings().find(
                 new MethodId(call.owner, call.name, call.desc));
+        PrimitiveCopyCounts.Hint hint = primitiveCopyCounts.preferred(call);
+        int count = hint.count();
+        String fixed = count == 0 ? null : "::jnative::bounded_primitive_array_copy<" + element + ", "
+                + count + (hint.sourceOffset() < 0 ? "" : ", " + hint.sourceOffset())
+                + ">(" + String.join(", ", args.subList(0, 4)) + ")";
         return new GuardedPrimitiveCopy(
                 "::jnative::bounded_primitive_array_copy<" + element + ">(" + String.join(", ", args) + ")",
                 className(target.helper().owner()) + "::" + memberName(target.helper())
-                        + "(" + String.join(", ", args) + ")");
+                        + "(" + String.join(", ", args) + ")", count, fixed);
     }
 
     private static String primitiveCopyElement(Type array) {
@@ -2775,14 +2982,22 @@ public final class CppEmitter implements Opcodes {
     }
 
     private static boolean smallConstantCopy(MethodInsnNode call) {
-        int value = constantCopyCount(call);
+        int value = trailingIntLiteral(call);
         return value >= 0 && value <= 64;
     }
 
-    private static int constantCopyCount(MethodInsnNode call) {
-        AbstractInsnNode count = call.getPrevious();
+    static int trailingIntLiteral(MethodInsnNode call) {
+        return intLiteral(previousOperand(call));
+    }
+
+    static AbstractInsnNode previousOperand(AbstractInsnNode instruction) {
+        AbstractInsnNode count = instruction.getPrevious();
         while(count instanceof LineNumberNode || count instanceof FrameNode)
             count = count.getPrevious();
+        return count;
+    }
+
+    static int intLiteral(AbstractInsnNode count) {
         // A label may merge a different operand-stack value from another path.
         // Do not infer the count merely from the last fallthrough instruction.
         if(count == null || count instanceof LabelNode) return -1;
@@ -2904,7 +3119,7 @@ public final class CppEmitter implements Opcodes {
                         && source.getSort() == Type.ARRAY && source.getDimensions() == 1) {
                     String element = primitiveCopyElement(source);
                     if(element != null) {
-                        int fixedCount = constantCopyCount(call);
+                        int fixedCount = trailingIntLiteral(call);
                         if(boundedCopy && fixedCount >= 0 && fixedCount <= 32)
                             direct = "::jnative::" + (copyBoundary
                                     ? "bounded_primitive_array_copy_inline" : "bounded_primitive_array_copy")

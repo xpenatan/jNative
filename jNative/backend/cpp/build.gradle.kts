@@ -18,6 +18,7 @@ publishing {
 
 dependencies {
     api(project(":jNative:compiler"))
+    testImplementation(project(":jNative:interop"))
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
 }

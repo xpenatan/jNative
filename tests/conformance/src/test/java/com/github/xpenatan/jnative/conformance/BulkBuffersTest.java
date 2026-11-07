@@ -267,7 +267,8 @@ class BulkBuffersTest {
                 ProcessHarness.run(
                         temporary,
                         List.of(result.executable().toString()),
-                        Duration.ofSeconds(30),
+                        // Concurrent forced GC can dominate the unoptimized build.
+                        Duration.ofSeconds(buildType == BuildType.DEBUG ? 90 : 30),
                         Map.of("JNATIVE_GC_INTERVAL", "2")));
     }
 }

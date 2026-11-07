@@ -168,21 +168,37 @@ final class OwnedArrays {
         ordinaryArrays.removeAll(unprovedAssignments);
     }
 
-    // A trivial getter creates an alias, not necessarily an escape. All reachable
-    // callers are analyzed below; reflection/native/worker exposure still excludes
-    // the field before this proof. More complex returned aliases stay conservative.
+    // A return of the same receiver field on every exit creates an alias. The
+    // method may update the array before returning it. All uses of the returned
+    // value still go through the ordinary borrower and escape analysis.
     private FieldId getterField(Program.Method method) {
         if(method.nativeSymbol() != null || callbackEntries.contains(method.id())
+                || program.reflection().methods().contains(method.id())
+                || Type.getReturnType(method.id().descriptor()).getSort() != Type.ARRAY
                 || (method.bytecode().access & (ACC_STATIC | ACC_NATIVE | ACC_ABSTRACT)) != 0)
             return null;
-        List<AbstractInsnNode> code = new ArrayList<>();
-        for(AbstractInsnNode instruction : method.bytecode().instructions)
-            if(instruction.getOpcode() >= 0) code.add(instruction);
-        if(code.size() != 3 || !(code.get(0) instanceof VarInsnNode receiver)
-                || receiver.getOpcode() != ALOAD || receiver.var != 0
-                || !(code.get(1) instanceof FieldInsnNode field) || field.getOpcode() != GETFIELD
-                || code.get(2).getOpcode() != ARETURN) return null;
-        return id(field);
+        FieldId result = null;
+        for(AbstractInsnNode instruction : method.bytecode().instructions) {
+            if(instruction instanceof VarInsnNode store && store.getOpcode() == ASTORE && store.var == 0)
+                return null;
+            if(instruction.getOpcode() != ARETURN) continue;
+            if(!(previousInBlock(instruction) instanceof FieldInsnNode field) || field.getOpcode() != GETFIELD
+                    || !(previousInBlock(field) instanceof VarInsnNode receiver)
+                    || receiver.getOpcode() != ALOAD || receiver.var != 0)
+                return null;
+            FieldId returned = id(field);
+            if(result != null && !result.equals(returned)) return null;
+            result = returned;
+        }
+        return result;
+    }
+
+    private static AbstractInsnNode previousInBlock(AbstractInsnNode instruction) {
+        AbstractInsnNode previous = instruction.getPrevious();
+        while(previous instanceof LineNumberNode || previous instanceof FrameNode)
+            previous = previous.getPrevious();
+        // A jump may supply its own operand at a label, so never cross one.
+        return previous;
     }
 
     private FieldId returnedField(AbstractInsnNode instruction) {

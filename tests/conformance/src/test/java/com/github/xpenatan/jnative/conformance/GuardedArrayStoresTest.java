@@ -88,6 +88,27 @@ class GuardedArrayStoresTest {
                     static void bytes(byte[] target, int value) { target[0] = (byte)value; target[3] = (byte)(value + 1); }
                     static void booleans(boolean[] target, boolean value) { target[0] = value; target[3] = !value; }
                     static void variable(int[] target, int index) { target[0] = 11; target[index] = 13; }
+                    static void offsetStores(int[] target, int offset, boolean rotated) {
+                        if (rotated) {
+                            target[offset] = 11;
+                            target[offset + 1] = 13;
+                            target[offset + 16] = 17;
+                        } else {
+                            target[offset - 1] = 19;
+                            target[offset + 6] = 23;
+                        }
+                    }
+                    static void offsetMutation(int[] target, int offset) {
+                        target[offset] = 11;
+                        target[offset + 1] = 13;
+                        offset += 3;
+                        target[offset] = 17;
+                        target[offset + 1] = 19;
+                    }
+                    static void wrapping(int[] target, int offset) {
+                        target[offset - Integer.MAX_VALUE] = 29;
+                        target[offset + 1] = 31;
+                    }
                     static int effect() { effects++; System.gc(); return effects + 20; }
                     static void calls(int[] target) { target[0] = 11; target[3] = effect(); }
                     static void fieldRead(int[] target) { target[0] = 11; target[3] = fieldValue; }
@@ -145,6 +166,19 @@ class GuardedArrayStoresTest {
                         catch (ArrayIndexOutOfBoundsException expected) { System.out.println("vertices bounds"); }
                         System.out.println(Arrays.toString(target));
                     }
+                    static void observeOffset(int[] target, int offset, int operation) {
+                        try {
+                            switch (operation) {
+                                case 0: offsetStores(target, offset, true); break;
+                                case 1: offsetStores(target, offset, false); break;
+                                case 2: offsetMutation(target, offset); break;
+                                default: wrapping(target, offset);
+                            }
+                            System.out.println("offset ok");
+                        } catch (NullPointerException expected) { System.out.println("offset null"); }
+                        catch (ArrayIndexOutOfBoundsException expected) { System.out.println("offset bounds"); }
+                        System.out.println(operation + ":" + offset + ":" + Arrays.toString(target));
+                    }
                     static void kinds(int length) {
                         long[] l = length < 0 ? null : new long[length];
                         double[] d = length < 0 ? null : new double[length];
@@ -182,6 +216,13 @@ class GuardedArrayStoresTest {
                             observeVertices(new float[length], false);
                         }
                         observeVertices(null, true); observeVertices(null, false);
+                        for (int operation = 0; operation < 4; operation++) {
+                            for (int offset : new int[] {Integer.MIN_VALUE, -1, 0, 1, 16, Integer.MAX_VALUE}) {
+                                observeOffset(new int[20], offset, operation);
+                                observeOffset(new int[2], offset, operation);
+                                observeOffset(null, offset, operation);
+                            }
+                        }
                         for (int length : new int[] {-1, 0, 1, 4}) kinds(length);
                         int[] first = new int[3], second = new int[3];
                         reassign(first, second);
@@ -227,6 +268,16 @@ class GuardedArrayStoresTest {
         assertEquals(16, occurrences(vertices, ".set_unchecked("), vertices);
         String reassigned = body(cpp, "reassign");
         assertEquals(2, occurrences(reassigned, ".covers(0, 2)"), reassigned);
+        String offset = body(cpp, "offsetStores");
+        assertEquals(2, occurrences(offset, ".covers("), offset);
+        assertEquals(5, occurrences(offset, ".set_unchecked("), offset);
+        assertTrue(offset.contains("static_cast<std::int64_t>"), offset);
+        String mutated = body(cpp, "offsetMutation");
+        assertEquals(2, occurrences(mutated, ".covers("), mutated);
+        assertEquals(4, occurrences(mutated, ".set_unchecked("), mutated);
+        String wrapped = body(cpp, "wrapping");
+        assertEquals(1, occurrences(wrapped, ".covers("), wrapped);
+        assertEquals(2, occurrences(wrapped, ".set_unchecked("), wrapped);
         for(String name : List.of("calls", "fieldRead", "fieldWrite", "divide", "branch",
                 "variable", "oversized", "handler", "bytes", "booleans")) {
             String body = body(cpp, name);
@@ -234,7 +285,8 @@ class GuardedArrayStoresTest {
         }
         String negative = body(cpp, "negative");
         assertTrue(negative.contains(".covers(-1, 2)"), negative);
-        assertTrue(body(cpp, "scatter").contains("::jnative::PrimitiveArrayView<std::int32_t>"), cpp);
+        String scatter = body(cpp, "scatter");
+        assertTrue(scatter.contains("::jnative::PrimitiveArrayView<std::int32_t,"), scatter);
         var compiled = builder.compile(generated);
         assertEquals(expected, ProcessHarness.run(temporary,
                 List.of(compiled.executable().toString()), Duration.ofSeconds(90),

@@ -138,6 +138,7 @@ final class CppNames {
     private final Map<String, String> fields = new LinkedHashMap<>();
     private final Map<MethodId, String> calls = new LinkedHashMap<>();
     private final Map<MethodId, String> initializedMethods = new LinkedHashMap<>();
+    private final Map<MethodId, String> inlineMethods = new HashMap<>();
     private final Map<String, String> enclosing = new LinkedHashMap<>();
 
     private final SourceLayout layout;
@@ -303,6 +304,21 @@ final class CppNames {
 
     String initializedMethod(MethodId id) {
         return Objects.requireNonNull(initializedMethods.get(id), id.toString());
+    }
+
+    void registerInlineMethods(Program program, Collection<MethodId> eligible) {
+        inlineMethods.clear();
+        Set<String> used = new HashSet<>(RUNTIME_MEMBERS);
+        used.addAll(methods.values());
+        used.addAll(fields.values());
+        used.addAll(initializedMethods.values());
+        for(var node : program.classes().values()) used.add(simpleName(node.name));
+        for(MethodId id : eligible.stream().sorted(Comparator.comparing(MethodId::toString)).toList())
+            inlineMethods.put(id, unique("inline_" + method(id), used));
+    }
+
+    String inlineMethod(MethodId id) {
+        return Objects.requireNonNull(inlineMethods.get(id), id.toString());
     }
 
     String field(String owner, String name, String descriptor) {

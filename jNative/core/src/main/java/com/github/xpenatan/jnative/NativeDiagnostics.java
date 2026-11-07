@@ -627,7 +627,9 @@ public final class NativeDiagnostics {
             location.put("sourceFile", source);
             location.put("sourceSha256", sourceHashes.get(source));
             var candidates = new ArrayList<Map<String, Object>>();
-            for(Object mapping : Json.array(sourceMap.getOrDefault("classes", List.of()))) {
+            var mappings = new ArrayList<>(Json.array(sourceMap.getOrDefault("classes", List.of())));
+            mappings.addAll(Json.array(sourceMap.getOrDefault("inlineClasses", List.of())));
+            for(Object mapping : mappings) {
                 var entry = Json.object(mapping);
                 if(source.equals("src/" + entry.get("cppFile"))) candidates.add(entry);
             }

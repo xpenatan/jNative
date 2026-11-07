@@ -27,9 +27,9 @@ import java.util.function.Predicate;
 final class ReadableMethodEmitter {
     record Result(String source, String reason, MethodEffects.Summary cooperativeWork,
                   boolean protectsArguments, boolean protectsEntryArguments,
-                  boolean protectsTerminalArguments) {
+                  boolean protectsTerminalArguments, boolean segmentedRoots) {
         Result(String source, String reason) {
-            this(source, reason, null, false, false, false);
+            this(source, reason, null, false, false, false, false);
         }
     }
 
@@ -65,13 +65,21 @@ final class ReadableMethodEmitter {
     private record ArrayRead(int kind, Object array, Object index) {
     }
 
+    private record ArraySnapshot(AbstractInsnNode access, Value value) {
+    }
+
     private final Map<FieldRead, Value> fieldReads = new HashMap<>();
     private final Map<FieldId, Boolean> invariantStaticArrays = new HashMap<>();
     private final Map<FieldId, Boolean> invariantInstanceArrays = new HashMap<>();
     private Set<MethodId> initializationMethods;
-    private final Map<ArrayRead, Value> arrayReads = new HashMap<>();
+    private final Map<ArrayRead, ArraySnapshot> arrayReads = new HashMap<>();
     private final Map<Local, Object> localReadIdentities = new HashMap<>();
+    private final Set<Object> checkedReceiverReads = new HashSet<>();
     private final Map<Block, Loop> loops = new HashMap<>();
+    private final Map<Loop, CountedLoop> countedLoops = new HashMap<>();
+    private final Map<Loop, LoopRangePlan> loopRangePlans = new HashMap<>();
+    private final Map<Local, ScalarDeclaration> scalarDeclarations = new HashMap<>();
+    private final Map<AbstractInsnNode, ScalarArray> scalarArrays = new IdentityHashMap<>();
     private final Map<Block, Set<Block>> postdominators = new HashMap<>();
     private final List<Value> sharedValues = new ArrayList<>();
     private final Set<Block> handlerEntries = new HashSet<>();
@@ -86,6 +94,8 @@ final class ReadableMethodEmitter {
     private final Set<ArrayViewKey> uncheckedArrayViews = new HashSet<>();
     private final boolean splitExceptionRegions;
     private final boolean initializedEntry;
+    private final boolean initializedDependencyEntry;
+    private final Set<String> knownInitializers;
     private final boolean tailFastPath;
     private final boolean boundedFastPath;
     private final Set<String> delegationInitializers;
@@ -95,6 +105,7 @@ final class ReadableMethodEmitter {
     private final boolean deferredRoots;
     private final Set<Step> exceptionalSteps = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<AbstractInsnNode> confinedArrays;
+    private final ConfinedArrays.Facts confinedFacts;
     private final Set<AbstractInsnNode> ordinaryArrays;
     private final Map<AbstractInsnNode, Type> arrayTypes;
     private Block block;
@@ -147,9 +158,12 @@ final class ReadableMethodEmitter {
         this.method = method;
         this.splitExceptionRegions = splitExceptionRegions;
         this.initializedEntry = initializedEntry;
+        this.initializedDependencyEntry = initializedEntry && backend.initializedDependencyEntry(method.id());
+        this.delegationInitializers = backend.delegationInitializationDependencies(method.id());
+        this.knownInitializers = boundedFastPath || initializedDependencyEntry
+                ? backend.initializationDependencies(method.id()) : tailFastPath ? delegationInitializers : Set.of();
         this.tailFastPath = tailFastPath;
         this.boundedFastPath = boundedFastPath;
-        this.delegationInitializers = backend.delegationInitializationDependencies(method.id());
         this.rootedReferences = !boundedLeaf() && !tailFastPath
                 && (!backend.delegatesRoots(method.id()) || !delegationInitializers.isEmpty());
         this.boundedNormalReturn =
@@ -157,8 +171,8 @@ final class ReadableMethodEmitter {
         // A throwing call can collect before entering a handler. Publish handler
         // locals eagerly even if every handler ultimately throws again.
         this.deferredRoots = boundedNormalReturn && method.bytecode().tryCatchBlocks.isEmpty();
-        this.confinedArrays =
-                new HashSet<>(backend.confinedArrayInstructions(method));
+        this.confinedFacts = backend.confinedArrayFacts(method);
+        this.confinedArrays = new HashSet<>(confinedFacts.origins().keySet());
         this.confinedArrays.addAll(backend.ownedArrayInstructions(method.id()));
         var storage = backend.arrayStorage(method, confinedArrays);
         this.ordinaryArrays = storage.ordinary();
@@ -186,6 +200,7 @@ final class ReadableMethodEmitter {
         try {
             if(method.nativeSymbol() != null) fail("native import adapter");
             prepare();
+            planScalarArrays();
             for(Block current : blocks) lower(current);
             connectValues();
             simplify();
@@ -194,6 +209,9 @@ final class ReadableMethodEmitter {
             bypassEmptyJumps();
             analyzeRegions();
             Node body = region(blocks.getFirst(), null, Context.EMPTY, new HashSet<>());
+            planCountedLoops();
+            planLoopRanges();
+            planScalarDeclarations();
             if(!exitLabels.isEmpty()) {
                 // Labeled Java exits must not jump over a C++ initialization. The
                 // values keep their evaluation sites, but their storage is hoisted.
@@ -218,7 +236,8 @@ final class ReadableMethodEmitter {
             // existing method-wide frame until their lexical lifetimes are proven.
             scopedColdRoots =
                     deferredRoots
-                            && (boundedFastPath || backend.initializationDependencies(method.id()).isEmpty())
+                            && (boundedFastPath || initializedDependencyEntry
+                                    || backend.initializationDependencies(method.id()).isEmpty())
                             && exitLabels.isEmpty()
                             && !method.id().name().equals("<clinit>")
                             && instructions.stream()
@@ -263,13 +282,15 @@ final class ReadableMethodEmitter {
                                 + (reference(parameter.type)
                                 ? parameter.name + "_argument"
                                 : parameter.name));
-            if(initializedEntry && backend.inlineInitializedEntry(method.id()))
-                out.append("JNATIVE_INLINE_ENTRY ");
+            boolean inlineImplementation = !initializedEntry && backend.inlineImplementation(method.id());
+            if(inlineImplementation) out.append("JNATIVE_FORCEINLINE ");
+            else if(initializedEntry) out.append(backend.initializedEntryQualifier(method.id()));
             out.append(type(Type.getReturnType(method.id().descriptor())))
                     .append(' ')
                     .append(names.definitionName(owner))
                     .append("::")
-                    .append(initializedEntry ? names.initializedMethod(method.id()) : names.method(method.id()))
+                    .append(initializedEntry ? names.initializedMethod(method.id())
+                            : inlineImplementation ? names.inlineMethod(method.id()) : names.method(method.id()))
                     .append('(')
                     .append(String.join(", ", declarations))
                     .append(") {\n");
@@ -284,6 +305,12 @@ final class ReadableMethodEmitter {
                                                 ? source
                                                 : "Unknown Source"))
                         .append(");\n");
+            PackedFloatCopy packedCopy = backend.packedFloatCopy(method);
+            if (packedCopy != null) {
+                List<String> arguments = parameters.stream()
+                        .map(parameter -> parameter.name + (reference(parameter.type) ? "_argument" : "")).toList();
+                out.append("    if (").append(packedCopy.guard(arguments)).append(") return;\n");
+            }
             int rootFramePosition = out.length();
             Writer writer = new Writer(out);
             if(rootedReferences && (method.bytecode().access & ACC_STATIC) == 0)
@@ -295,7 +322,7 @@ final class ReadableMethodEmitter {
                     if(local.rooted()) writer.root(1, local.name, initial);
                     else writer.line(1, "::jnative::Object* " + local.name + " = " + initial + ";");
                 }
-                else if(!local.parameter)
+                else if(!local.parameter && !scalarDeclarations.containsKey(local))
                     out.append("    ")
                             .append(type(local.type))
                             .append(' ')
@@ -307,7 +334,8 @@ final class ReadableMethodEmitter {
                 else writer.line(1, type(value.type) + " " + value.name + "{};");
             }
             String initializationGuard = "";
-            if(deferredRoots && !boundedFastPath && !backend.initializationDependencies(method.id()).isEmpty()) {
+            if(deferredRoots && !boundedFastPath && !initializedDependencyEntry
+                    && !backend.initializationDependencies(method.id()).isEmpty()) {
                 List<String> pending =
                         backend.initializationDependencies(method.id()).stream()
                                 .sorted()
@@ -475,7 +503,7 @@ final class ReadableMethodEmitter {
                     && writer.publishedBranches.containsAll(collectingBranches)
                     && writer.publishedLazyLoops.containsAll(lazyLoops)
                     && writer.protectedCopies.containsAll(lazyGuardedCopies);
-            boolean boundedWarmEntry = !tailFastPath && !boundedFastPath && boundedNormalReturn
+            boolean boundedWarmEntry = !tailFastPath && !boundedFastPath && !initializedDependencyEntry && boundedNormalReturn
                     // A root-free body already checks initialization in place.
                     // Duplicating it adds guards without avoiding any root work.
                     && rootSlots > 0
@@ -493,7 +521,7 @@ final class ReadableMethodEmitter {
                         splitExceptionRegions, initializedEntry, terminalWarmEntry, boundedWarmEntry).emit();
                 if(fast.source() == null)
                     return new Result(out.toString(), null, cooperativeWork, protectsArguments,
-                            protectsEntryArguments, protectsTerminalArguments);
+                            protectsEntryArguments, protectsTerminalArguments, true);
                 // Whole-method returning work and terminal-prefix work remain distinct proofs.
                 Set<String> initialized = new TreeSet<>(boundedWarmEntry
                         ? backend.initializationDependencies(method.id()) : delegationInitializers);
@@ -511,7 +539,8 @@ final class ReadableMethodEmitter {
                 protectsEntryArguments = false;
             }
             return new Result(out.toString(), null, cooperativeWork, protectsArguments,
-                    protectsEntryArguments, protectsTerminalArguments);
+                    protectsEntryArguments, protectsTerminalArguments,
+                    lazyRoots || scopedRejoiningRoots || scopedColdRoots);
         } catch(Unstructured exception) {
             if(!splitExceptionRegions
                     && !method.bytecode().tryCatchBlocks.isEmpty()
@@ -977,7 +1006,7 @@ final class ReadableMethodEmitter {
     private int protectedCalls(Expr expression, Map<String, Local> byName,
                                Predicate<MethodInsnNode> protects, List<Expr> calls) {
         int count = 0;
-        if(expression.collection) {
+        if(expression.javaEffects.has(JavaEffects.Kind.SAFEPOINT)) {
             if(expression.generatedCall == null
                     || !protects.test(expression.generatedCall)
                     || expression.values.stream().anyMatch(value -> value.inline && value.expression.collects()))
@@ -1194,25 +1223,91 @@ final class ReadableMethodEmitter {
         return local(instruction.var, type, false, false, "local" + instruction.var);
     }
 
+    private record ScalarArray(List<Local> elements) {
+    }
+
+    private void planScalarArrays() {
+        // No stack joins or repeated allocation sites. Confinement proves that
+        // every remaining alias is a local copy and the object cannot be observed.
+        if (blocks.size() != 1 || !exceptionTable.isEmpty() || !monitorEntries.isEmpty()) return;
+        Map<AbstractInsnNode, List<AbstractInsnNode>> uses = new IdentityHashMap<>();
+        confinedFacts.origins().forEach((use, allocation) -> {
+            if (use != allocation) uses.computeIfAbsent(allocation, ignored -> new ArrayList<>()).add(use);
+        });
+        for (AbstractInsnNode instruction : instructions) {
+            List<AbstractInsnNode> aliases = uses.get(instruction);
+            if (aliases == null || confinedFacts.borrowed().contains(instruction)) continue;
+            Type element = switch (((IntInsnNode)instruction).operand) {
+                case T_INT -> Type.INT_TYPE;
+                case T_LONG -> Type.LONG_TYPE;
+                case T_FLOAT -> Type.FLOAT_TYPE;
+                case T_DOUBLE -> Type.DOUBLE_TYPE;
+                default -> null;
+            };
+            if (element == null) continue;
+            Integer length = confinedFacts.range(instruction).exact();
+            if (length == null || length < 0 || length > 8) continue;
+            boolean supported = true;
+            for (AbstractInsnNode alias : aliases) {
+                int opcode = alias.getOpcode();
+                if (opcode == ALOAD || opcode == ASTORE || opcode == ARRAYLENGTH || opcode >= DUP && opcode <= SWAP)
+                    continue;
+                if (opcode != element.getOpcode(IALOAD) && opcode != element.getOpcode(IASTORE)
+                        || !confinedFacts.range(alias).insideArray(length)
+                        || confinedFacts.range(alias).exact() == null) {
+                    supported = false;
+                    break;
+                }
+            }
+            if (!supported) continue;
+            var elements = new ArrayList<Local>();
+            for (int index = 0; index < length; ++index) {
+                String name = CppNames.unique("array_slot" + index, usedNames);
+                Local slot = new Local(name, element, false, false, false);
+                locals.put(name, slot);
+                elements.add(slot);
+            }
+            ScalarArray array = new ScalarArray(List.copyOf(elements));
+            scalarArrays.put(instruction, array);
+            for (AbstractInsnNode alias : aliases) scalarArrays.put(alias, array);
+        }
+    }
+
+    private static Value virtualArray(ScalarArray array) {
+        Value value = new Value(OBJECT, "", expr(List.of(), ignored -> {
+            throw new Unstructured("scalar array used as a reference");
+        }, JavaEffects.PURE), false);
+        value.scalarArray = array;
+        value.inline = true;
+        return value;
+    }
+
     private void lower(Block current) {
         block = current;
         fieldReads.clear();
         arrayReads.clear();
         localReadIdentities.clear();
+        checkedReceiverReads.clear();
         stack.clear();
         stack.addAll(current.inputs);
         for(int i = current.start; i < current.end; ++i) {
             AbstractInsnNode instruction = instructions.get(i);
             sourceLine = lines.get(i);
             int opcode = instruction.getOpcode();
-            // A resolved, bounded leaf may change primitive fields while preserving
-            // reference fields and array contents. It cannot publish or synchronize.
-            // Other calls remain barriers, as do class initialization and reassignment.
-            if(instruction instanceof MethodInsnNode call && backend.preservesReferenceReads(method.id(), call)) {
-                fieldReads.keySet().removeIf(read -> !reference(Type.getType(read.descriptor)));
-            }
-            else if(instruction instanceof MethodInsnNode
-                    || instruction instanceof InvokeDynamicInsnNode
+            ScalarArray scalar = scalarArrays.get(instruction);
+            if(instruction instanceof MethodInsnNode call) {
+                HeapEffects.Summary memory = backend.heapEffects(method.id(), call, knownInitializers);
+                if(memory.barrier()) {
+                    fieldReads.clear();
+                    arrayReads.clear();
+                } else {
+                    // Different declarations cannot alias. Receivers of the same
+                    // declaration stay conservative, including inherited fields.
+                    fieldReads.keySet().removeIf(read -> memory.writes().contains(
+                            new FieldId(read.owner, read.name, read.descriptor)));
+                    if(memory.arraysWritten()) arrayReads.clear();
+                }
+            } else if(instruction instanceof InvokeDynamicInsnNode
                     || opcode == NEW
                     || opcode == PUTSTATIC
                     || opcode == PUTFIELD
@@ -1221,13 +1316,6 @@ final class ReadableMethodEmitter {
                     || opcode == MONITOREXIT) {
                 fieldReads.clear();
                 arrayReads.clear();
-            }
-            // Primitive payload stores cannot replace entries of an Object[]. Keep
-            // those reference snapshots, but invalidate all potentially aliased
-            // primitive reads. Reference stores retain the conservative barrier.
-            if(opcode >= IASTORE && opcode <= SASTORE) {
-                if(opcode == AASTORE) arrayReads.clear();
-                else arrayReads.keySet().removeIf(read -> read.kind != 4);
             }
             if((opcode >= ISTORE && opcode <= ASTORE)
                     || opcode == IINC) arrayReads.clear();
@@ -1255,7 +1343,7 @@ final class ReadableMethodEmitter {
                                         + ", "
                                         + quote(text)
                                         + ")",
-                                true));
+                                JavaEffects.RUNTIME_CHECK));
                 current.endKind = End.RETURN;
                 i += 4;
                 continue;
@@ -1291,6 +1379,11 @@ final class ReadableMethodEmitter {
                 continue;
             }
             if(instruction instanceof VarInsnNode variable) {
+                if (scalar != null) {
+                    if (opcode == ALOAD) stack.add(virtualArray(scalar));
+                    else if (opcode != ASTORE || pop().scalarArray != scalar) fail("invalid scalar array alias");
+                    continue;
+                }
                 Local local = local(variable);
                 if(opcode >= ILOAD && opcode <= ALOAD) {
                     Value value =
@@ -1300,7 +1393,7 @@ final class ReadableMethodEmitter {
                                     new Expr(
                                             List.of(),
                                             ignored -> local.read(),
-                                            false,
+                                            JavaEffects.PURE,
                                             Set.of(local.name)));
                     value.receiver = local.receiver;
                     value.expression.directLocal = local;
@@ -1330,7 +1423,7 @@ final class ReadableMethodEmitter {
                                                 + ", "
                                                 + increment.incr
                                                 + ")",
-                                false,
+                                JavaEffects.PURE,
                                 Set.of(local.name));
                 block.steps.add(new Step(Kind.STORE, expression, null, local, sourceLine));
                 expression.incrementLocal = local;
@@ -1338,44 +1431,14 @@ final class ReadableMethodEmitter {
                 localReadIdentities.remove(local);
                 continue;
             }
-            if(opcode >= IADD && opcode <= DREM) {
+            JavaArithmetic arithmetic = JavaArithmetic.decode(opcode);
+            if(arithmetic != null) {
                 Value right = pop(), left = pop();
-                int operation = (opcode - IADD) / 4;
-                boolean integral =
-                        left.type.equals(Type.INT_TYPE) || left.type.equals(Type.LONG_TYPE);
                 Expr expression =
                         expr(
                                 List.of(left, right),
-                                v ->
-                                        integral
-                                                ? "::jnative::"
-                                                + List.of(
-                                                        "add",
-                                                        "sub",
-                                                        "mul",
-                                                        "divide",
-                                                        "remainder")
-                                                .get(operation)
-                                                + "("
-                                                + v.get(0)
-                                                + ", "
-                                                + v.get(1)
-                                                + ")"
-                                                : operation == 4
-                                                ? "std::fmod("
-                                                + v.get(0)
-                                                + ", "
-                                                + v.get(1)
-                                                + ")"
-                                                : "("
-                                                + v.get(0)
-                                                + " "
-                                                + List.of("+", "-", "*", "/")
-                                                .get(operation)
-                                                + " "
-                                                + v.get(1)
-                                                + ")",
-                                integral && operation >= 3);
+                                v -> arithmetic.render(v.get(0), v.get(1)),
+                                arithmetic.effects());
                 expression.integerOperation = opcode;
                 push(left.type, "value", expression);
                 continue;
@@ -1399,47 +1462,6 @@ final class ReadableMethodEmitter {
                                                 + ")"
                                                 : "(-" + v.getFirst() + ")",
                                 false));
-                continue;
-            }
-            if(opcode >= ISHL && opcode <= LUSHR) {
-                Value right = pop(), left = pop();
-                push(
-                        left.type,
-                        "value",
-                        expr(
-                                List.of(left, right),
-                                v ->
-                                        "::jnative::"
-                                                + List.of(
-                                                        "shift_left",
-                                                        "shift_right",
-                                                        "unsigned_shift")
-                                                .get((opcode - ISHL) / 2)
-                                                + "("
-                                                + v.get(0)
-                                                + ", "
-                                                + v.get(1)
-                                                + ")",
-                                false));
-                continue;
-            }
-            if(opcode >= IAND && opcode <= LXOR) {
-                Value right = pop(), left = pop();
-                push(
-                        left.type,
-                        "value",
-                        expr(
-                                List.of(left, right),
-                                v ->
-                                        "("
-                                                + v.get(0)
-                                                + " "
-                                                + List.of("&", "|", "^").get((opcode - IAND) / 2)
-                                                + " "
-                                                + v.get(1)
-                                                + ")",
-                                false));
-                stack.getLast().expression.integerOperation = opcode;
                 continue;
             }
             if(opcode >= I2L && opcode <= I2S) {
@@ -1520,7 +1542,7 @@ final class ReadableMethodEmitter {
                 continue;
             }
             if(opcode == RETURN) {
-                effect(Expr.text("return", false));
+                effect(Expr.text("return", JavaEffects.PURE));
                 current.endKind = End.RETURN;
                 continue;
             }
@@ -1529,7 +1551,7 @@ final class ReadableMethodEmitter {
                         expr(
                                 List.of(pop()),
                                 v -> "::jnative::throw_object(" + v.getFirst() + ")",
-                                true));
+                                JavaEffects.RUNTIME_CHECK));
                 current.endKind = End.RETURN;
                 continue;
             }
@@ -1559,7 +1581,7 @@ final class ReadableMethodEmitter {
                                                 + ", {"
                                                 + String.join(", ", v)
                                                 + "})",
-                                true));
+                                JavaEffects.ALLOCATE));
                 continue;
             }
             if(instruction instanceof TypeInsnNode type) {
@@ -1567,6 +1589,13 @@ final class ReadableMethodEmitter {
                 continue;
             }
             if(instruction instanceof IntInsnNode value && opcode == NEWARRAY) {
+                if (scalar != null) {
+                    pop();
+                    for (Local slot : scalar.elements)
+                        block.steps.add(new Step(Kind.STORE, Expr.use(literal(slot.type, "0")), null, slot, sourceLine));
+                    stack.add(virtualArray(scalar));
+                    continue;
+                }
                 String descriptor =
                         switch(value.operand) {
                             case T_BOOLEAN -> "[Z";
@@ -1600,13 +1629,18 @@ final class ReadableMethodEmitter {
                                                 + ", "
                                                 + v.getFirst()
                                                 + ")",
-                                true));
+                                JavaEffects.ALLOCATE));
                 stack.getLast().expression.confinedArray = confinedArrays.contains(instruction);
                 stack.getLast().expression.ordinaryArray = ordinaryArrays.contains(instruction);
                 continue;
             }
             if(opcode == ARRAYLENGTH) {
                 Value array = pop();
+                if (scalar != null) {
+                    if (array.scalarArray != scalar) fail("invalid scalar array length");
+                    constant(Type.INT_TYPE, Integer.toString(scalar.elements.size()));
+                    continue;
+                }
                 push(
                         Type.INT_TYPE,
                         "length",
@@ -1617,8 +1651,7 @@ final class ReadableMethodEmitter {
                                     return arrayLengths.containsKey(key) ? arrayLengths.get(key)
                                             : "::jnative::array_length(" + v.getFirst() + ")";
                                 },
-                                true)
-                                .withoutCollection());
+                                JavaEffects.CHECK));
                 stack.getLast().expression.arrayLength = true;
                 continue;
             }
@@ -1628,14 +1661,14 @@ final class ReadableMethodEmitter {
             }
             if(opcode == MONITORENTER) {
                 block.steps.add(
-                        new Step(Kind.MONITOR_ENTER, Expr.use(pop()), null, null, sourceLine));
+                        new Step(Kind.MONITOR_ENTER, Expr.use(pop(), JavaEffects.MONITOR), null, null, sourceLine));
                 continue;
             }
             if(opcode == MONITOREXIT) {
                 MonitorRegion monitor = monitorExits.get(i);
                 if(monitor == null) fail("monitor release has no matching lexical scope");
                 pop();
-                effect(Expr.text(monitor.name + ".unlock()", true));
+                effect(Expr.text(monitor.name + ".unlock()", JavaEffects.MONITOR));
                 continue;
             }
             fail("instruction " + opcode + " has no structured lowering yet");
@@ -1661,12 +1694,12 @@ final class ReadableMethodEmitter {
         else if(constant instanceof Double value)
             constant(Type.DOUBLE_TYPE, floating(value, false));
         else if(constant instanceof String value)
-            push(OBJECT, "text", Expr.text(backend.stringLiteral(value), true).withoutCollection());
+            push(OBJECT, "text", Expr.text(backend.stringLiteral(value), JavaEffects.READ));
         else if(constant instanceof Type value)
             push(
                     OBJECT,
                     "class_type",
-                    Expr.text(backend.classLiteral(value), true).withoutCollection());
+                    Expr.text(backend.classLiteral(value), JavaEffects.READ));
         else fail("constant has no structured lowering");
     }
 
@@ -1677,7 +1710,8 @@ final class ReadableMethodEmitter {
         if(opcode == GETSTATIC && program.bindings().field(field.owner, field.name, field.desc) != null) {
             fieldReads.clear();
             arrayReads.clear();
-            push(Type.getType(field.desc), "platform_field", Expr.text(backend.platformFieldCall(field, true), true));
+            push(Type.getType(field.desc), "platform_field",
+                    Expr.text(backend.platformFieldCall(field, true), JavaEffects.CALL));
             return;
         }
         if(opcode == GETSTATIC
@@ -1690,8 +1724,7 @@ final class ReadableMethodEmitter {
                     Expr.text(
                                     backend.classLiteral(
                                             Type.getType(RuntimeLibrary.primitive(field.owner))),
-                                    true)
-                            .withoutCollection());
+                                    JavaEffects.READ));
             return;
         }
         String owner = backend.fieldOwner(field.owner, field.name, field.desc);
@@ -1701,12 +1734,12 @@ final class ReadableMethodEmitter {
         // while another thread is still running its class initializer.
         boolean initializedOwner =
                 owner.equals(method.id().owner()) && (method.bytecode().access & ACC_STATIC) != 0;
-        if(isStatic && !initializedOwner && block.initialized.add(owner)) {
+        if(isStatic && !initializedOwner && !knownInitializers.contains(owner) && block.initialized.add(owner)) {
             // Initialization may mutate fields/arrays, publish data or collect.
             // Keep it at this instruction, before considering reuse of the read.
             fieldReads.clear();
             arrayReads.clear();
-            effect(Expr.text(classReference(owner) + "::ensure_initialized()", true));
+            effect(Expr.text(classReference(owner) + "::ensure_initialized()", JavaEffects.INITIALIZE));
         }
         FieldRead reusable = null;
         if(!put) {
@@ -1793,9 +1826,8 @@ final class ReadableMethodEmitter {
                             }
                             return ordinary;
                         },
-                        true);
+                        put ? JavaEffects.WRITE : JavaEffects.READ);
         if(put && (isStatic || receiver.receiver)) expression.afterArguments = true;
-        expression.withoutCollection();
         if(!put) expression.confinedArray = confinedArrays.contains(field);
         if(!put) expression.ordinaryArray = ordinaryArrays.contains(field);
         if(finalInstance || finalStatic) {
@@ -2006,6 +2038,21 @@ final class ReadableMethodEmitter {
         var args = new ArrayList<Value>();
         for(int i = types.length - 1; i >= 0; --i) args.addFirst(pop());
         boolean isStatic = call.getOpcode() == INVOKESTATIC;
+        boolean initialized = knownInitializers.contains(declaration.owner())
+                || declaration.owner().equals(method.id().owner()) && (method.bytecode().access & ACC_STATIC) != 0;
+        if (isStatic && initialized && !request.javaSourceLocations() && !program.platform(declaration.owner())
+                && !backend.hasBinding(call)) {
+            PrimitiveInline inline = backend.primitiveInline(declaration);
+            if (inline != null) {
+                // Keep effectful argument evaluation in Java order, even for
+                // repeated or unused parameters in the substituted expression.
+                push(Type.getReturnType(call.desc), CppNames.identifier(call.name) + "_result",
+                        expr(args, inline::render, JavaEffects.PURE).repeats());
+                return;
+            }
+        }
+        PackedFloatCopy packedCopy = isStatic && declaration.owner().equals(method.id().owner())
+                ? backend.packedFloatCopy(program.methods().get(declaration)) : null;
         Value receiver = isStatic ? null : pop();
         if(call.owner.equals("java/lang/Object") && call.name.equals("<init>")) {
             if(!receiver.receiver)
@@ -2013,20 +2060,21 @@ final class ReadableMethodEmitter {
                         expr(
                                 List.of(receiver),
                                 v -> "::jnative::require_non_null(" + v.getFirst() + ")",
-                                true)
-                                .withoutCollection());
+                                JavaEffects.CHECK));
             return;
         }
         // The null check follows evaluation of all arguments, as on the JVM.
         // Success cannot collect. A failure unwinds, and handler-visible references
         // are retained separately by exceptional liveness, just like field checks.
-        if(receiver != null && !receiver.receiver)
+        if(receiver != null && !receiver.receiver
+                && (receiver.expression == null || receiver.expression.directLocal == null
+                        || !receiver.type.equals(receiver.expression.directLocal.type)
+                        || checkedReceiverReads.add(receiver.expression.readIdentity)))
             effect(
                     expr(
                             List.of(receiver),
                             v -> "::jnative::require_non_null(" + v.getFirst() + ")",
-                            true)
-                            .withoutCollection());
+                            JavaEffects.CHECK));
         var operands = new ArrayList<Value>();
         if(receiver != null) operands.add(receiver);
         operands.addAll(args);
@@ -2064,9 +2112,15 @@ final class ReadableMethodEmitter {
                                         + result
                                         + " }())";
                             }
+                            if(isStatic && !request.stackTraces().javaFrames()) {
+                                String nativeInline = backend.inlineBoundedNative(declaration, values);
+                                if(nativeInline != null) return nativeInline;
+                            }
                             String owner = declaration.owner(), member = names.method(declaration);
-                            if(backend.initializedCall(method.id(), call, declaration))
+                            if((isStatic || call.getOpcode() == INVOKESPECIAL)
+                                    && backend.initializedCall(method.id(), call, declaration, knownInitializers))
                                 member = names.initializedMethod(declaration);
+                            else if(backend.inlineImplementation(declaration)) member = names.inlineMethod(declaration);
                             if(isStatic)
                                 return classReference(owner)
                                         + "::"
@@ -2077,10 +2131,13 @@ final class ReadableMethodEmitter {
                             MethodId direct = backend.directTarget(call);
                             if(direct != null) {
                                 String target = names.className(direct.owner());
+                                String directMember = backend.initializedCall(method.id(), call, direct, knownInitializers)
+                                        ? names.initializedMethod(direct) : backend.inlineImplementation(direct)
+                                        ? names.inlineMethod(direct) : names.method(direct);
                                 if(backend.isInterface(direct.owner()))
                                     return target
                                             + "::"
-                                            + names.method(direct)
+                                            + directMember
                                             + "("
                                             + String.join(", ", rendered)
                                             + ")";
@@ -2091,7 +2148,7 @@ final class ReadableMethodEmitter {
                                         + ")->"
                                         + names.simpleName(direct.owner())
                                         + "::"
-                                        + names.method(direct)
+                                        + directMember
                                         + "("
                                         + String.join(", ", values)
                                         + ")";
@@ -2129,15 +2186,16 @@ final class ReadableMethodEmitter {
                                     + String.join(", ", values)
                                     + ")";
                         },
-                        true);
+                        JavaEffects.CALL);
         // Library lowering can reuse operands, including arraycopy's count guard.
         // Prevent effectful reads/calls from being duplicated or moved past one
         // another; their existing LET steps preserve Java evaluation order.
-        if(program.platform(call.owner)
+        if(packedCopy != null || program.platform(call.owner)
                 || RuntimeLibrary.intrinsic(call.owner, call.name, call.desc)) expression.repeats();
         else expression.afterArguments = true;
         if(backend.boundedCall(method.id(), call)) expression.withoutCollection();
         expression.generatedCall = call;
+        expression.packedCopy = packedCopy;
         List<Type> argumentTypes = args.stream().map(value -> value.type).toList();
         if(backend.guardedPrimitiveCopy(call, Collections.nCopies(args.size(), ""), argumentTypes) != null)
             expression.guardedCopy = rendered -> backend.guardedPrimitiveCopy(call, rendered, argumentTypes);
@@ -2203,7 +2261,7 @@ final class ReadableMethodEmitter {
             case NEW -> {
                 String expression;
                 if(!program.platform(owner)) {
-                    effect(Expr.text(classReference(owner) + "::ensure_initialized()", true));
+                    effect(Expr.text(classReference(owner) + "::ensure_initialized()", JavaEffects.INITIALIZE));
                     expression = "::jnative::allocate<" + names.className(owner) + ">()";
                 }
                 else if(RuntimeLibrary.throwable(owner))
@@ -2213,7 +2271,7 @@ final class ReadableMethodEmitter {
                 else if(backend.nativeBase(owner) != null)
                     expression = "::jnative::allocate<" + backend.nativeBase(owner) + ">()";
                 else throw new Unstructured("allocation has no structured lowering");
-                push(OBJECT, "object", Expr.text(expression, true));
+                push(OBJECT, "object", Expr.text(expression, JavaEffects.ALLOCATE));
             }
             case ANEWARRAY -> {
                 push(
@@ -2222,13 +2280,13 @@ final class ReadableMethodEmitter {
                         expr(
                                 List.of(pop()),
                                 v -> backend.referenceArrayAllocation(owner, v.getFirst()),
-                                true));
+                                JavaEffects.ALLOCATE));
             }
             case CHECKCAST -> {
                 Expr cast = expr(List.of(pop()),
                         v -> (backend.exactTypeCheck(owner) ? "::jnative::check_cast_exact("
                                 : "::jnative::check_cast(") + v.getFirst() + ", "
-                                + backend.typeCheckArgument(owner) + ")", true).preservesReference();
+                                + backend.typeCheckArgument(owner) + ")", JavaEffects.RUNTIME_CHECK).preservesReference();
                 if(backend.exactTypeCheck(owner)) cast.withoutCollection();
                 push(OBJECT, "object", cast);
             }
@@ -2236,7 +2294,7 @@ final class ReadableMethodEmitter {
                 Expr check = expr(List.of(pop()),
                         v -> (backend.exactTypeCheck(owner) ? "::jnative::instance_of_exact("
                                 : "::jnative::instance_of(") + v.getFirst() + ", "
-                                + backend.typeCheckArgument(owner) + ")", true);
+                                + backend.typeCheckArgument(owner) + ")", JavaEffects.RUNTIME_CHECK);
                 if(backend.exactTypeCheck(owner)) check.withoutCollection();
                 push(Type.INT_TYPE, "instance", check);
             }
@@ -2251,11 +2309,30 @@ final class ReadableMethodEmitter {
         int kind = opcode - (put ? IASTORE : IALOAD);
         boolean exactStore = opcode == AASTORE && backend.boundedReferenceStore(method.id(), instruction);
         Value value = put ? pop() : null, index = pop(), array = pop();
+        ScalarArray scalar = scalarArrays.get(instruction);
+        if (scalar != null) {
+            if (array.scalarArray != scalar) fail("invalid scalar array access");
+            Local slot = scalar.elements.get(confinedFacts.range(instruction).exact());
+            if (put) block.steps.add(new Step(Kind.STORE, Expr.use(value), null, slot, sourceLine));
+            else {
+                Expr read = new Expr(List.of(), ignored -> slot.name, JavaEffects.PURE, Set.of(slot.name));
+                read.directLocal = slot;
+                push(slot.type, slot.name + "_value", read);
+            }
+            return;
+        }
+        if (put) {
+            // Primitive payload stores do not affect Object[] entries. Keep
+            // other primitive snapshots only if typed range/alias facts prove disjointness.
+            if (opcode == AASTORE) arrayReads.clear();
+            else arrayReads.entrySet().removeIf(entry -> entry.getKey().kind != 4
+                    && !confinedFacts.disjoint(entry.getValue().access, instruction));
+        }
         ArrayRead reusable = new ArrayRead(kind, readIdentity(array), readIdentity(index));
         if(!put) {
-            Value earlier = arrayReads.get(reusable);
+            ArraySnapshot earlier = arrayReads.get(reusable);
             if(earlier != null) {
-                stack.add(earlier);
+                stack.add(earlier.value);
                 return;
             }
         }
@@ -2311,24 +2388,22 @@ final class ReadableMethodEmitter {
                                     + (put ? ", " + stored : "")
                                     + ")";
                         },
-                        true);
+                        put ? kind == 4 && !exactStore ? JavaEffects.REFERENCE_WRITE : JavaEffects.WRITE
+                                : JavaEffects.READ);
         if(kind != 5 && (kind != 4 || !put)) {
             expression.arrayElement = element;
             expression.arrayStore = put;
         }
-        if(!put || kind != 4 || exactStore) expression.withoutCollection();
         if(put) {
             effect(expression);
             // The successful store has performed its null and bounds checks. Forward
             // only exact-width primitives: byte/boolean, char and short stores narrow
             // their input, and reference stores have a separate type/GC contract.
-            // lower() clears prior reads before every possibly aliasing store and
-            // at unknown calls, synchronization, local changes and control-flow boundaries.
-            if(kind >= 0 && kind <= 3) arrayReads.put(reusable, value);
+            if(kind >= 0 && kind <= 3) arrayReads.put(reusable, new ArraySnapshot(instruction, value));
         }
         else {
             push(type, "element", expression);
-            arrayReads.put(reusable, stack.getLast());
+            arrayReads.put(reusable, new ArraySnapshot(instruction, stack.getLast()));
         }
     }
 
@@ -2543,7 +2618,7 @@ final class ReadableMethodEmitter {
     }
 
     private Value literal(Type type, String expression) {
-        Value value = new Value(type, "", Expr.text(expression, false), rootedReferences);
+        Value value = new Value(type, "", Expr.text(expression, JavaEffects.PURE), rootedReferences);
         if(type.equals(Type.INT_TYPE)) {
             try {
                 value.expression.integerConstant = Integer.valueOf(expression);
@@ -2577,7 +2652,12 @@ final class ReadableMethodEmitter {
 
     private static Expr expr(
             List<Value> values, Function<List<String>, String> render, boolean effect) {
-        return new Expr(values, render, effect, Set.of());
+        return expr(values, render, effect ? JavaEffects.RUNTIME_CHECK : JavaEffects.PURE);
+    }
+
+    private static Expr expr(
+            List<Value> values, Function<List<String>, String> render, JavaEffects effects) {
+        return new Expr(values, render, effects, Set.of());
     }
 
     private static void fail(String reason) {
@@ -2629,6 +2709,7 @@ final class ReadableMethodEmitter {
         boolean rootedReferences;
         boolean inline, receiver, shared;
         Value alias;
+        ScalarArray scalarArray;
 
         Value(Type type, String name, Expr expression, boolean rootedReferences) {
             this.type =
@@ -2656,13 +2737,13 @@ final class ReadableMethodEmitter {
     private static final class Expr {
         List<Value> values;
         final Function<List<String>, String> render;
-        final boolean effect;
-        boolean collection;
+        JavaEffects javaEffects;
         final Set<String> locals;
         boolean repeated;
         boolean afterArguments;
         MethodInsnNode generatedCall;
         Function<List<String>, CppEmitter.GuardedPrimitiveCopy> guardedCopy;
+        PackedFloatCopy packedCopy;
         boolean confinedArray;
         boolean ordinaryArray;
         boolean stableArrayReference;
@@ -2685,21 +2766,24 @@ final class ReadableMethodEmitter {
         Expr(
                 List<Value> values,
                 Function<List<String>, String> render,
-                boolean effect,
+                JavaEffects effects,
                 Set<String> locals) {
             this.values = List.copyOf(values);
             this.render = render;
-            this.effect = effect;
-            this.collection = effect;
+            this.javaEffects = effects;
             this.locals = locals;
         }
 
-        static Expr text(String text, boolean effect) {
-            return new Expr(List.of(), ignored -> text, effect, Set.of());
+        static Expr text(String text, JavaEffects effects) {
+            return new Expr(List.of(), ignored -> text, effects, Set.of());
         }
 
         static Expr use(Value value) {
-            Expr expression = expr(List.of(value), List::getFirst, false);
+            return use(value, JavaEffects.PURE);
+        }
+
+        static Expr use(Value value, JavaEffects effects) {
+            Expr expression = expr(List.of(value), List::getFirst, effects);
             expression.passThrough = true;
             return expression;
         }
@@ -2715,12 +2799,18 @@ final class ReadableMethodEmitter {
         }
 
         Expr withoutCollection() {
-            collection = false;
+            javaEffects = javaEffects.withoutSafepoint();
             return this;
         }
 
         boolean collects() {
-            return collection || values.stream().anyMatch(v -> v.inline && v.expression.collects());
+            return javaEffects.has(JavaEffects.Kind.SAFEPOINT)
+                    || values.stream().anyMatch(v -> v.inline && v.expression.collects());
+        }
+
+        boolean mayThrow() {
+            return javaEffects.has(JavaEffects.Kind.THROW)
+                    || values.stream().anyMatch(v -> v.inline && v.expression.mayThrow());
         }
 
         String code() {
@@ -2728,7 +2818,7 @@ final class ReadableMethodEmitter {
         }
 
         int effects() {
-            return (effect ? 1 : 0)
+            return (javaEffects.pure() ? 0 : 1)
                     + values.stream()
                     .filter(v -> v.inline)
                     .mapToInt(v -> v.expression.effects())
@@ -2983,6 +3073,83 @@ final class ReadableMethodEmitter {
     }
 
     private record Loop(Block header, Set<Block> members, Block exit) {
+    }
+
+    private record CountedLoop(Step update) {
+    }
+
+    private record ScalarDeclaration(Step initializer, boolean immutable) {
+    }
+
+    private void planScalarDeclarations() {
+        if (!exceptionTable.isEmpty() || !monitorEntries.isEmpty() || !exitLabels.isEmpty()) return;
+        Block entry = blocks.getFirst();
+        if (loops.containsKey(entry)) return;
+        Map<Local, Step> initializers = new LinkedHashMap<>();
+        Set<String> reads = new HashSet<>();
+        for (Step step : entry.steps) {
+            // Array-store versioning may put later statements inside two scopes.
+            if (step.expression.arrayStore) break;
+            reads.addAll(step.expression.reads());
+            if (step.kind == Kind.STORE && !step.local.parameter && !reference(step.local.type)
+                    && !reads.contains(step.local.name)) initializers.putIfAbsent(step.local, step);
+        }
+        if (initializers.isEmpty()) return;
+        Map<Local, Integer> stores = new HashMap<>();
+        for (Block current : blocks) {
+            for (Step step : current.steps) {
+                if (step.kind == Kind.STORE && initializers.containsKey(step.local))
+                    stores.merge(step.local, 1, Integer::sum);
+            }
+        }
+        initializers.forEach((local, initializer) ->
+                scalarDeclarations.put(local, new ScalarDeclaration(initializer, stores.get(local) == 1)));
+    }
+
+    private void planCountedLoops() {
+        if (!exceptionTable.isEmpty() || !monitorEntries.isEmpty() || !exitLabels.isEmpty()) return;
+        for (Loop loop : loops.values()) {
+            CountedLoop counted = countedLoop(loop);
+            if (counted != null) countedLoops.put(loop, counted);
+        }
+    }
+
+    private static CountedLoop countedLoop(Loop loop) {
+        Block header = loop.header;
+        if (header.endKind != End.IF || loop.exit == null || !header.transfers.isEmpty()
+                || header.steps.stream().anyMatch(step -> step.kind != Kind.CONDITION)
+                || (header.yes != loop.exit && header.no != loop.exit)) return null;
+        Expr condition = header.condition.expression;
+        if (condition.comparisonOperator == null || condition.values.size() != 2
+                || condition.values.stream().anyMatch(value -> !value.type.equals(Type.INT_TYPE))) return null;
+        String comparison = header.yes == loop.exit
+                ? inverseComparison(condition.comparisonOperator) : condition.comparisonOperator;
+        if (!comparison.equals("<") && !comparison.equals(">")) return null;
+
+        Block latch = null;
+        for (Block member : loop.members) {
+            if (!member.successors().contains(header)) continue;
+            if (latch != null || member.endKind != End.JUMP || !member.transfers.isEmpty()) return null;
+            latch = member;
+        }
+        if (latch == null || latch.steps.isEmpty()) return null;
+        Step update = latch.steps.getLast();
+        if (update.kind != Kind.STORE || update.expression.incrementLocal != update.local
+                || Math.abs(update.expression.incrementAmount) != 1) return null;
+
+        // A strict comparison of int values rules out MAX_VALUE before ++
+        // and MIN_VALUE before --. The latch must be the only counter write
+        // and the only path back to the head, including continue edges.
+        int amount = update.expression.incrementAmount;
+        int counterOperand = (amount > 0) == comparison.equals("<") ? 0 : 1;
+        Value counter = condition.values.get(counterOperand).canonical();
+        if (!counter.inline || counter.expression.directLocal != update.local) return null;
+        for (Block member : loop.members) {
+            for (Step step : member.steps) {
+                if (step != update && step.kind == Kind.STORE && step.local == update.local) return null;
+            }
+        }
+        return new CountedLoop(update);
     }
 
     /**
@@ -3567,7 +3734,7 @@ final class ReadableMethodEmitter {
                                 s.kind == Kind.MONITOR_ENTER
                                         || s.kind != Kind.EDGE
                                         && s.kind != Kind.CONDITION
-                                        && s.expression.effects() != 0)) return statements;
+                                        && s.expression.mayThrow())) return statements;
         var handlers = new ArrayList<Handler>();
         for(TryCatchBlockNode entry : exceptionTable) {
             if(current.start < positions.get(entry.start)
@@ -3821,8 +3988,9 @@ final class ReadableMethodEmitter {
                 if(step.kind == Kind.CONDITION
                         || step.kind == Kind.EDGE
                         || step.kind == Kind.MONITOR_ENTER) continue;
+                if(out.writeLoopUpdate(step, indent)) continue;
                 out.location(indent, step.line);
-                if(out.writeGuardedCopy(step, indent)) continue;
+                if(out.writeGuardedCopy(step, indent) || out.writePackedCopy(step, indent)) continue;
                 String expression = step.expression.code();
                 switch(step.kind) {
                     case LET -> {
@@ -3838,12 +4006,7 @@ final class ReadableMethodEmitter {
                                             + ";");
                         out.snapshotArrayViews(step.value, indent);
                     }
-                    case STORE -> out.line(
-                            indent,
-                            step.local.name
-                                    + (step.local.rooted()
-                                    ? ".set(" + expression + ");"
-                                    : " = " + expression + ";"));
+                    case STORE -> out.writeStore(step, expression, indent);
                     case RETURN -> out.returnValue(indent, expression);
                     case EFFECT -> out.line(indent, expression + ";");
                     default -> throw new AssertionError();
@@ -4096,6 +4259,7 @@ final class ReadableMethodEmitter {
                             && header.transfers.isEmpty();
             boolean invert = testAtHead && header.yes == loop.exit;
             Map<ArrayViewKey, String> previousLengths = simple ? out.beginLoopLength(loop, indent) : null;
+            CountedLoop counted = simple ? out.countedLoop(loop) : null;
             boolean lazy = out.lazyLoop(loop);
             int rootCheckpoint = out.nextRootSlot;
             boolean coldCheckpoint = out.coldRootsActive;
@@ -4109,18 +4273,18 @@ final class ReadableMethodEmitter {
                 out.publishedLazyLoops.add(loop);
                 out.line(indent, "::jnative::LoopSafepoint loop_safepoints;");
             }
-            LoopGuard guard = simple ? out.rangeGuard(loop, indent, invert) : null;
+            LoopGuard guard = simple ? out.rangeGuard(loop, indent) : null;
             if(guard != null) {
                 out.line(indent, "if (" + guard.condition + ") {");
                 out.useUnchecked(guard.arrays, true);
-                writeGuardedLoop(out, indent + 1, invert, guard, lazy);
+                writeGuardedLoop(out, indent + 1, invert, guard, lazy, counted);
                 out.useUnchecked(guard.arrays, false);
                 out.line(indent, "} else {");
-                writeLoop(out, indent + 1, simple, invert, true, lazy);
+                writeLoop(out, indent + 1, simple, invert, true, lazy, counted);
                 out.line(indent, "}");
             }
             else {
-                writeLoop(out, indent, simple, invert, true, lazy);
+                writeLoop(out, indent, simple, invert, true, lazy, counted);
             }
             if(lazy) {
                 out.nextRootSlot = rootCheckpoint;
@@ -4139,12 +4303,14 @@ final class ReadableMethodEmitter {
 
         private void writeLoop(
                 Writer out, int indent, boolean simple, boolean invert, boolean budgeted,
-                boolean initialTestSatisfied) {
+                boolean initialTestSatisfied, CountedLoop counted) {
             Block header = loop.header;
             String pollBudget = budgeted ? out.loopPollBudget(loop, indent) : null;
             if(simple) out.location(indent, header.condition.line);
-            out.line(indent, initialTestSatisfied ? "do {"
-                    : "while (" + (simple ? header.condition(invert) : "true") + ") {");
+            boolean headerUpdate = !initialTestSatisfied && out.canMoveUpdate(counted);
+            String condition = simple ? header.condition(invert) : "true";
+            if (initialTestSatisfied) out.line(indent, "do {");
+            else out.beginLoopBody(indent, condition, counted, headerUpdate);
             out.reset();
             out.line(
                     indent + 1,
@@ -4159,14 +4325,14 @@ final class ReadableMethodEmitter {
                 out.line(indent + 2, "break;");
                 out.line(indent + 1, "}");
             }
-            body.write(out, indent + 1);
+            out.writeLoopBody(body, indent + 1, counted, headerUpdate);
             out.label(header, indent + 1);
             out.line(indent, initialTestSatisfied ? "} while (" + header.condition(invert) + ");" : "}");
             out.reset();
         }
 
         private void writeGuardedLoop(Writer out, int indent, boolean invert, LoopGuard guard,
-                                      boolean initialTestSatisfied) {
+                                      boolean initialTestSatisfied, CountedLoop counted) {
             // The range proof establishes a unit induction step, stable limit,
             // representable final counter and a bounded body on every path.
             // Rows loaded inside the body never survive the poll at a chunk boundary.
@@ -4177,9 +4343,10 @@ final class ReadableMethodEmitter {
             out.line(indent + 1, "const std::int32_t " + end
                     + " = static_cast<std::int32_t>(std::min<std::int64_t>(static_cast<std::int64_t>("
                     + guard.counter.read() + ") + 64LL, " + guard.end + "));");
-            out.line(indent + 1, "while (" + guard.counter.read() + " < " + end + ") {");
+            boolean headerUpdate = out.canMoveUpdate(counted);
+            out.beginLoopBody(indent + 1, guard.counter.read() + " < " + end, counted, headerUpdate);
             out.reset();
-            body.write(out, indent + 2);
+            out.writeLoopBody(body, indent + 2, counted, headerUpdate);
             out.line(indent + 1, "}");
             out.line(indent, initialTestSatisfied ? "} while (" + loop.header.condition(invert) + ");" : "}");
             out.reset();
@@ -4326,11 +4493,30 @@ final class ReadableMethodEmitter {
     private record AccessRange(ArrayViewKey array, Affine index, Long mask) {
     }
 
+    private record StridedRange(Affine first, Affine last, long stride) {
+    }
+
+    private record ArrayRange(long mask, List<StridedRange> spans, boolean counterOnly) {
+    }
+
+    private record LoopRangePlan(Affine counter, Affine limit, Value lengthArray, boolean inclusive,
+                                 Map<ArrayViewKey, ArrayRange> arrays) {
+    }
+
     private record LoopGuard(String condition, Set<ArrayViewKey> arrays, Local counter, String end) {
     }
 
-    private record StoreRegion(int end, ArrayViewKey array, int minimum, int maximum,
+    private record StoreIndex(ArrayViewKey array, Local base, int offset) {
+    }
+
+    private record StoreRegion(int end, ArrayViewKey array, Local base, int minimum, int maximum,
                                int stores, boolean bounded) {
+        String bound(int offset) {
+            // Test the mathematical index. A wrapped Java index keeps its checked
+            // path unless the mathematical result is itself within the array.
+            return base == null ? Integer.toString(offset)
+                    : Affine.local(base).add(Affine.constant(offset), 1).code();
+        }
     }
 
     private static final class RangeState {
@@ -4513,6 +4699,82 @@ final class ReadableMethodEmitter {
         return backedge;
     }
 
+    private void planLoopRanges() {
+        for (Loop loop : loops.values()) {
+            LoopRangePlan plan = loopRangePlan(loop);
+            if (plan != null) loopRangePlans.put(loop, plan);
+        }
+    }
+
+    private LoopRangePlan loopRangePlan(Loop loop) {
+        Block header = loop.header;
+        if (header.endKind != End.IF || loop.exit == null || (header.yes != loop.exit && header.no != loop.exit)
+                || !header.transfers.isEmpty() || header.steps.stream().anyMatch(step -> step.kind != Kind.CONDITION))
+            return null;
+        Expr condition = header.condition.expression;
+        if (condition.comparisonOperator == null) return null;
+        String comparison = header.yes == loop.exit
+                ? inverseComparison(condition.comparisonOperator) : condition.comparisonOperator;
+        if (!comparison.equals("<") && !comparison.equals("<=")) return null;
+        boolean restricted = !boundedLoopBody(loop);
+        if (restricted && !boundedLoopBody(loop, true)) return null;
+
+        RangeState head = new RangeState();
+        Affine counter = head.value(condition.values.get(0)), limit = head.value(condition.values.get(1));
+        Value testedLimit = condition.values.get(1).canonical();
+        Value lengthArray = testedLimit.inline && testedLimit.expression.arrayLength
+                ? testedLimit.expression.values.getFirst() : null;
+        if (!unitLocal(counter) || limit == null && lengthArray == null
+                || limit != null && !limit.terms.isEmpty() && !unitLocal(limit)) return null;
+        RangeState body = loopRanges(loop);
+        if (body == null || !Long.valueOf(1).equals(body.stride(counter))) return null;
+        if (limit != null && limit.terms.keySet().stream().anyMatch(body.locals::containsKey)) return null;
+
+        Map<ArrayViewKey, List<AccessRange>> accesses = new LinkedHashMap<>();
+        Set<ArrayViewKey> rejected = new HashSet<>();
+        for (AccessRange range : body.ranges) {
+            if (restricted && (!range.array.stableReference
+                    || range.array.local != null && body.locals.containsKey(range.array.local))) continue;
+            if (range.mask == null && body.stride(range.index) == null) rejected.add(range.array);
+            else accesses.computeIfAbsent(range.array, ignored -> new ArrayList<>()).add(range);
+        }
+        accesses.keySet().removeAll(rejected);
+        if (accesses.isEmpty()) return null;
+        Map<ArrayViewKey, ArrayRange> arrays = new LinkedHashMap<>();
+        accesses.forEach((array, ranges) -> arrays.put(array, arrayRange(body, counter, ranges)));
+        return new LoopRangePlan(counter, limit, lengthArray, comparison.equals("<="), arrays);
+    }
+
+    private static boolean unitLocal(Affine affine) {
+        return affine != null && affine.constant == 0 && affine.terms.size() == 1
+                && affine.terms.values().iterator().next() == 1L;
+    }
+
+    private static ArrayRange arrayRange(RangeState state, Affine counter, List<AccessRange> accesses) {
+        Map<Map<Local, Long>, long[]> spans = new LinkedHashMap<>();
+        long mask = -1;
+        boolean counterOnly = true;
+        for (AccessRange access : accesses) {
+            if (access.mask != null) {
+                mask = Math.max(mask, access.mask);
+                counterOnly = false;
+                continue;
+            }
+            counterOnly &= access.index.equals(counter);
+            long offset = access.index.constant;
+            long[] span = spans.computeIfAbsent(access.index.terms, ignored -> new long[]{offset, offset});
+            span[0] = Math.min(span[0], offset);
+            span[1] = Math.max(span[1], offset);
+        }
+        var ranges = new ArrayList<StridedRange>();
+        spans.forEach((terms, span) -> {
+            Affine low = new Affine(terms, span[0]), high = new Affine(terms, span[1]);
+            long stride = state.stride(low);
+            ranges.add(stride < 0 ? new StridedRange(high, low, stride) : new StridedRange(low, high, stride));
+        });
+        return new ArrayRange(mask, List.copyOf(ranges), counterOnly);
+    }
+
     private final class Writer {
         String typeCheckArgument(String type) {
             return backend.typeCheckArgument(type);
@@ -4529,6 +4791,8 @@ final class ReadableMethodEmitter {
         boolean argumentsPublished = true;
         boolean terminalArgumentsPublished = true;
         boolean initializationPublished;
+        CountedLoop activeCounter;
+        boolean counterInHeader;
         final Set<String> entryRoots = new HashSet<>();
         final Set<Node> publishedBranches = Collections.newSetFromMap(new IdentityHashMap<>());
         final Set<Loop> publishedLazyLoops = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -4538,6 +4802,54 @@ final class ReadableMethodEmitter {
 
         Writer(StringBuilder out) {
             this.out = out;
+        }
+
+        void writeStore(Step step, String expression, int indent) {
+            Local local = step.local;
+            ScalarDeclaration declaration = scalarDeclarations.get(local);
+            if (declaration != null && declaration.initializer == step) {
+                String qualifier = declaration.immutable ? "const " : "";
+                line(indent, qualifier + type(local.type) + " " + local.name + " = " + expression + ";");
+            } else {
+                line(indent, local.name + (local.rooted() ? ".set(" + expression + ");" : " = " + expression + ";"));
+            }
+        }
+
+        CountedLoop countedLoop(Loop loop) {
+            return countedLoops.get(loop);
+        }
+
+        boolean canMoveUpdate(CountedLoop counted) {
+            return counted != null && !request.javaSourceLocations();
+        }
+
+        private String increment(CountedLoop counted) {
+            Step update = counted.update;
+            return (update.expression.incrementAmount > 0 ? "++" : "--") + update.local.name;
+        }
+
+        void beginLoopBody(int indent, String condition, CountedLoop counted, boolean headerUpdate) {
+            line(indent, headerUpdate ? "for (; " + condition + "; " + increment(counted) + ") {"
+                    : "while (" + condition + ") {");
+        }
+
+        void writeLoopBody(Node body, int indent, CountedLoop counted, boolean headerUpdate) {
+            CountedLoop previous = activeCounter;
+            boolean previousPlacement = counterInHeader;
+            activeCounter = counted;
+            counterInHeader = headerUpdate;
+            body.write(this, indent);
+            activeCounter = previous;
+            counterInHeader = previousPlacement;
+        }
+
+        boolean writeLoopUpdate(Step step, int indent) {
+            if (activeCounter == null || activeCounter.update != step) return false;
+            if (!counterInHeader) {
+                location(indent, step.line);
+                line(indent, increment(activeCounter) + ";");
+            }
+            return true;
         }
 
         boolean lazyLoop(Loop loop) {
@@ -4569,6 +4881,18 @@ final class ReadableMethodEmitter {
             line(indent, "::jnative::safepoint();");
         }
 
+        boolean writePackedCopy(Step step, int indent) {
+            Expr expression = step.expression;
+            if (step.kind != Kind.EFFECT || expression.packedCopy == null
+                    || expression.values.stream().anyMatch(value -> value.inline && value.expression.effects() != 0))
+                return false;
+            List<String> values = expression.values.stream().map(Value::code).toList();
+            line(indent, "if (!" + expression.packedCopy.guard(values) + ") {");
+            line(indent + 1, expression.code() + ";");
+            line(indent, "}");
+            return true;
+        }
+
         boolean writeGuardedCopy(Step step, int indent) {
             Expr expression = step.expression;
             if(!lazyRoots || expression.guardedCopy == null) return false;
@@ -4580,7 +4904,13 @@ final class ReadableMethodEmitter {
             String count = values.getLast();
             int rootCheckpoint = nextRootSlot;
             boolean coldCheckpoint = coldRootsActive;
-            line(indent, "if (" + count + " >= 0 && " + count + " <= 64) {");
+            String guard = "if (" + count + " >= 0 && " + count + " <= 64) {";
+            if(copy.preferredCount() != 0) {
+                line(indent, "if (" + count + " == " + copy.preferredCount() + ") {");
+                line(indent + 1, copy.fixed() + ";");
+                guard = "} else " + guard;
+            }
+            line(indent, guard);
             line(indent + 1, copy.fast() + ";");
             line(indent, "} else {");
             activateRoots(indent + 1);
@@ -4644,8 +4974,9 @@ final class ReadableMethodEmitter {
                 StatementsNode.writeChecked(steps, this, indent);
                 return;
             }
+            RangeState indices = new RangeState();
             for(int start = 0; start < steps.size();) {
-                StoreRegion region = storeRegion(steps, start);
+                StoreRegion region = storeRegion(steps, start, indices);
                 if(region == null) {
                     StatementsNode.writeChecked(steps.subList(start, start + 1), this, indent);
                     ++start;
@@ -4659,15 +4990,17 @@ final class ReadableMethodEmitter {
                     // The array is an already evaluated local or immutable named
                     // value, not a repeated field read. Construct at the first
                     // store without throwing or moving any Java computation.
-                    String view = name(region.array.hint + "_store_elements");
+                    String view = region.base == null ? null : arrayViews.get(region.array);
                     Map<ArrayViewKey, String> previous = new LinkedHashMap<>(arrayViews);
                     line(indent, "{");
                     enterScope();
-                    line(indent + 1,
-                            region.array.declaration() + view
-                                    + "(" + region.array.source() + ");");
+                    if(view == null) {
+                        view = name(region.array.hint + "_store_elements");
+                        line(indent + 1, region.array.declaration() + view
+                                + "(" + region.array.source() + ");");
+                    }
                     line(indent + 1, "if (" + view + ".covers("
-                            + region.minimum + ", " + region.maximum + ")) {");
+                            + region.bound(region.minimum) + ", " + region.bound(region.maximum) + ")) {");
                     reset();
                     arrayViews.put(region.array, view);
                     useUnchecked(Set.of(region.array), true);
@@ -4688,21 +5021,20 @@ final class ReadableMethodEmitter {
             }
         }
 
-        private StoreRegion storeRegion(List<Step> steps, int start) {
-            ArrayViewKey array = constantStoreArray(steps.get(start));
-            if(array == null) return null;
+        private StoreRegion storeRegion(List<Step> steps, int start, RangeState indices) {
+            StoreIndex first = storeIndex(steps.get(start), indices);
+            if(first == null) return null;
             int minimum = Integer.MAX_VALUE, maximum = Integer.MIN_VALUE;
             int stores = 0, end = start, lastStore = start;
             for(; end < steps.size(); ++end) {
                 Step step = steps.get(end);
-                ArrayViewKey stored = constantStoreArray(step);
-                if(stored != null && stored.equals(array)) {
-                    int index = step.expression.values.get(1).canonical().expression.integerConstant;
-                    minimum = Math.min(minimum, index);
-                    maximum = Math.max(maximum, index);
+                StoreIndex stored = storeIndex(step, indices);
+                if(stored != null && stored.array.equals(first.array) && stored.base == first.base) {
+                    minimum = Math.min(minimum, stored.offset);
+                    maximum = Math.max(maximum, stored.offset);
                     ++stores;
                     lastStore = end;
-                } else if(step.kind != Kind.STORE || reference(step.local.type)
+                } else if(step.kind != Kind.STORE || step.local == first.base || reference(step.local.type)
                         || step.expression.effects() != 0) {
                     break;
                 }
@@ -4712,24 +5044,33 @@ final class ReadableMethodEmitter {
             // a smaller tail. LET declarations are boundaries: their C++ scope
             // or cached snapshot may be needed after the conditional region.
             boolean bounded = end - start <= 32 && stores <= 16;
-            return new StoreRegion(lastStore + 1, array, minimum, maximum, stores, bounded);
+            return new StoreRegion(lastStore + 1, first.array, first.base, minimum, maximum, stores, bounded);
         }
 
-        private ArrayViewKey constantStoreArray(Step step) {
+        private StoreIndex storeIndex(Step step, RangeState indices) {
             Expr expression = step.expression;
             if(step.kind != Kind.EFFECT || !expression.arrayStore
                     || expression.arrayElement == null || expression.values.size() != 3)
                 return null;
             Value index = expression.values.get(1).canonical();
             Value stored = expression.values.get(2).canonical();
-            if(!index.inline || index.expression.integerConstant == null
-                    || reference(stored.type)
+            if(!index.inline || index.expression.effects() != 0 || reference(stored.type)
                     || stored.inline && stored.expression.effects() != 0)
                 return null;
+            Affine range = indices.value(index);
+            if(range == null || range.constant < Integer.MIN_VALUE || range.constant > Integer.MAX_VALUE)
+                return null;
+            Local base = null;
+            if(!range.terms.isEmpty()) {
+                if(range.terms.size() != 1) return null;
+                var term = range.terms.entrySet().iterator().next();
+                if(term.getValue() != 1) return null;
+                base = term.getKey();
+            }
             ArrayViewKey array = arrayViewKey(expression.values.getFirst(), expression.arrayElement);
             // Keys carry Local/Value identity, never just their printed names.
             return array != null && (array.local != null || array.snapshot != null)
-                    ? array : null;
+                    ? new StoreIndex(array, base, (int)range.constant) : null;
         }
 
         Map<ArrayViewKey, String> beginLoopLength(Loop loop, int indent) {
@@ -4759,139 +5100,45 @@ final class ReadableMethodEmitter {
             arrayLengths.putAll(previous);
         }
 
-        String cachedLength(Value value) {
-            Value canonical = value.canonical();
-            return canonical.inline && canonical.expression.arrayLength
-                    ? arrayLengths.get(cachedArrayView(canonical.expression.values.getFirst())) : null;
-        }
+        LoopGuard rangeGuard(Loop loop, int indent) {
+            LoopRangePlan plan = loopRangePlans.get(loop);
+            if (plan == null) return null;
+            ArrayViewKey limitArray = plan.lengthArray == null ? null : cachedArrayView(plan.lengthArray);
+            String cachedLength = arrayLengths.get(limitArray);
+            if (plan.limit == null && cachedLength == null) return null;
+            String limit = plan.limit != null ? plan.limit.code() : "static_cast<std::int64_t>(" + cachedLength + ")";
+            Map<ArrayViewKey, ArrayRange> arrays = new LinkedHashMap<>(plan.arrays);
+            arrays.keySet().removeIf(array -> !arrayViews.containsKey(array) || uncheckedArrayViews.contains(array));
+            if (arrays.isEmpty()) return null;
 
-        LoopGuard rangeGuard(Loop loop, int indent, boolean invert) {
-            if(arrayViews.isEmpty()) return null;
-            boolean restrictedReferences = !boundedLoopBody(loop);
-            if(restrictedReferences && !boundedLoopBody(loop, true)) return null;
-            Expr condition = loop.header.condition.expression;
-            String comparison = condition.comparisonOperator;
-            if(comparison == null) return null;
-            if(invert)
-                comparison =
-                        switch(comparison) {
-                            case ">=" -> "<";
-                            case ">" -> "<=";
-                            default -> "";
-                        };
-            if(!comparison.equals("<") && !comparison.equals("<=")) return null;
-            RangeState state = new RangeState();
-            Affine counter = state.value(condition.values.get(0));
-            Affine limit = state.value(condition.values.get(1));
-            String cachedLength = cachedLength(condition.values.get(1));
-            if(counter == null
-                    || counter.constant != 0
-                    || counter.terms.size() != 1
-                    || counter.terms.values().iterator().next() != 1L
-                    || limit == null && cachedLength == null) return null;
-            // The limit is a literal, an unchanged int local or a stable array length.
-            if(limit != null && !limit.terms.isEmpty()
-                    && (limit.constant != 0
-                    || limit.terms.size() != 1
-                    || limit.terms.values().iterator().next() != 1L)) return null;
-            state = loopRanges(loop);
-            if(state == null || !Long.valueOf(1).equals(state.stride(counter))) return null;
-            if(limit != null)
-                for(Local local : limit.terms.keySet())
-                    if(state.locals.containsKey(local)) return null;
-            String limitCode = limit != null ? limit.code() : "static_cast<std::int64_t>(" + cachedLength + ")";
-            Map<ArrayViewKey, List<AccessRange>> ranges = new LinkedHashMap<>();
-            Set<ArrayViewKey> rejected = new HashSet<>();
-            for(AccessRange range : state.ranges) {
-                if(!arrayViews.containsKey(range.array)
-                        || uncheckedArrayViews.contains(range.array)) continue;
-                // A bounded call can replace mutable fields and row references.
-                // Only immutable field identities or unchanged dominating local
-                // views survive the new admission; snapshots keep checked access.
-                if(restrictedReferences && (!range.array.stableReference
-                        || range.array.local != null && state.locals.containsKey(range.array.local)))
-                    continue;
-                if(range.mask == null && state.stride(range.index) == null) rejected.add(range.array);
-                else ranges.computeIfAbsent(range.array, ignored -> new ArrayList<>()).add(range);
+            Local counter = plan.counter.terms.keySet().iterator().next();
+            ArrayRange lengthRange = arrays.get(limitArray);
+            if (!plan.inclusive && cachedLength != null && arrays.size() == 1
+                    && lengthRange != null && lengthRange.counterOnly) {
+                // A stable array length supplies the upper bound.
+                return new LoopGuard(counter.read() + " >= 0", arrays.keySet(), counter, limit);
             }
-            ranges.keySet().removeAll(rejected);
-            if(ranges.isEmpty()) return null;
-            if(comparison.equals("<") && cachedLength != null && ranges.size() == 1) {
-                ArrayViewKey limitArray = cachedArrayView(
-                        condition.values.get(1).canonical().expression.values.getFirst());
-                List<AccessRange> accesses = ranges.get(limitArray);
-                if(accesses != null && accesses.stream()
-                        .allMatch(range -> range.mask == null && range.index.equals(counter))) {
-                    // i < this array's immutable length already proves the upper
-                    // bound and representable final counter. Only a negative start
-                    // needs checked access; empty loops need no separate range case.
-                    // A constant nonnegative start lets C++ remove the fallback.
-                    Local induction = counter.terms.keySet().iterator().next();
-                    return new LoopGuard(induction.read() + " >= 0", ranges.keySet(), induction, limitCode);
-                }
-            }
+
+            String end = limit + (plan.inclusive ? " + 1LL" : "");
             String count = name("range_iterations");
-            line(
-                    indent,
-                    "const std::int64_t "
-                            + count
-                            + " = "
-                            + limitCode
-                            + " - "
-                            + counter.code()
-                            + (comparison.equals("<=") ? " + 1LL" : "")
-                            + ";");
+            line(indent, "const std::int64_t " + count + " = " + limit + " - " + plan.counter.code()
+                    + (plan.inclusive ? " + 1LL" : "") + ";");
             var guards = new ArrayList<String>();
             guards.add(count + " > 0 && " + count + " <= INT32_MAX");
-            guards.add(counter.code() + " + " + count + " <= INT32_MAX");
-            for(var entry : ranges.entrySet()) {
-                // Adjacent channels of the same strided access share one guard.
-                Map<Map<Local, Long>, long[]> spans = new LinkedHashMap<>();
-                long mask = -1;
-                for(AccessRange range : entry.getValue()) {
-                    if(range.mask != null) {
-                        mask = Math.max(mask, range.mask);
-                        continue;
-                    }
-                    long[] span =
-                            spans.computeIfAbsent(
-                                    range.index.terms,
-                                    ignored ->
-                                            new long[]{
-                                                    range.index.constant, range.index.constant
-                                            });
-                    span[0] = Math.min(span[0], range.index.constant);
-                    span[1] = Math.max(span[1], range.index.constant);
+            guards.add(plan.counter.code() + " + " + count + " <= INT32_MAX");
+            arrays.forEach((array, range) -> {
+                String view = arrayViews.get(array);
+                if (range.mask >= 0) guards.add(view + ".covers(0LL, " + range.mask + "LL)");
+                for (StridedRange span : range.spans) {
+                    String last = "(" + span.last.code() + " + (" + count + " - 1LL) * " + span.stride + "LL)";
+                    guards.add(view + ".covers(" + span.first.code() + ", " + last + ")");
                 }
-                if(mask >= 0) guards.add(arrayViews.get(entry.getKey()) + ".covers(0LL, " + mask + "LL)");
-                for(var span : spans.entrySet()) {
-                    Affine low = new Affine(span.getKey(), span.getValue()[0]);
-                    Affine high = new Affine(span.getKey(), span.getValue()[1]);
-                    long stride = state.stride(low);
-                    String first = (stride < 0 ? high : low).code();
-                    String last =
-                            "("
-                                    + (stride < 0 ? low : high).code()
-                                    + " + ("
-                                    + count
-                                    + " - 1LL) * "
-                                    + stride
-                                    + "LL)";
-                    guards.add(
-                            arrayViews.get(entry.getKey())
-                                    + ".covers("
-                                    + first
-                                    + ", "
-                                    + last
-                                    + ")");
-                }
-            }
+            });
             String valid = name("valid_array_ranges");
             line(indent, "const bool " + valid + " =");
-            for(int i = 0; i < guards.size(); i++)
+            for (int i = 0; i < guards.size(); ++i)
                 line(indent + 1, guards.get(i) + (i + 1 == guards.size() ? ";" : " &&"));
-            return new LoopGuard(valid, ranges.keySet(), counter.terms.keySet().iterator().next(),
-                    limitCode + (comparison.equals("<=") ? " + 1LL" : ""));
+            return new LoopGuard(valid, arrays.keySet(), counter, end);
         }
 
         void beginParameterArrayViews(int indent) {

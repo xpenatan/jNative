@@ -118,6 +118,9 @@ void Heap::attach(ThreadContext* thread) {
     std::unique_lock<::jnative::platform::Mutex> lock(mutex_);
     if (closed_) throw std::logic_error("Runtime has shut down");
     changed_.wait(lock, [&] { return !collecting_; });
+    // Arenas outlive detach. A subsequent attachment can inherit reported
+    // pressure even when every previous mutator has already left.
+    if (!arenas_.empty()) shared_allocation_pressure_.store(true, std::memory_order_release);
     ManagedArena* arena = nullptr;
     for (auto& candidate : arenas_) {
         if (!candidate->attached) { arena = candidate.get(); break; }

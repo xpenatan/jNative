@@ -14,6 +14,30 @@
 
 namespace {
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+void bounded_native_errors() {
+    require(jnative::invoke_bounded_native([] { return 37; }) == 37, "Scalar native result changed");
+    require(jnative::invoke_bounded_native([](std::int32_t first, std::int64_t second) {
+        return first + second;
+    }, std::int32_t(-1), std::int64_t(38)) == 37, "Scalar native argument conversion changed");
+    bool called = false;
+    jnative::invoke_bounded_native([&] { called = true; });
+    require(called, "Void native call was skipped");
+    for (int kind = 0; kind < 3; ++kind) {
+        bool caught = false;
+        try {
+            jnative::invoke_bounded_native([&]() -> int {
+                if (kind == 0) jnative::raise("java/lang/IllegalArgumentException");
+                if (kind == 1) throw std::bad_alloc();
+                throw std::runtime_error("scalar native failure");
+            });
+        } catch (const jnative::Thrown& error) {
+            const char* expected = kind == 0 ? "java/lang/IllegalArgumentException"
+                    : kind == 1 ? "java/lang/OutOfMemoryError" : "java/lang/RuntimeException";
+            caught = std::string(error.object()->type_name()) == expected;
+        }
+        require(caught, "Scalar native exception conversion changed");
+    }
+}
 struct Node final : jnative::Object {
     jnative::ManagedField<Node*> next;
     jnative::ManagedField<std::int32_t> value;
@@ -855,6 +879,40 @@ void contiguous_array_contracts() {
     contiguous_primitive_contracts<float>("[F");
     contiguous_primitive_contracts<double>("[D");
 }
+
+template<class T> void raw_primitive_transfer_contracts(const char* descriptor) {
+    using namespace jnative;
+    for (bool plain : {false, true}) {
+        if (plain && sizeof(T) == 1) continue;
+        LocalRoot<> source(plain ? new_confined_array<T>(descriptor, 96) : new_array(descriptor, 96));
+        PrimitiveArrayView<T, true> view(source.get());
+        for (int i = 0; i < 96; ++i) view.set(i, primitive_sample<T>(i));
+        Heap::instance().collect();
+        for (int count : {0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 65}) {
+            for (int alignment : {0, 1, 3, 7}) {
+                std::vector<std::uint8_t> output(96 * sizeof(T) + 16, 0xa5);
+                view.copy_to_bytes_unchecked(3, count, output.data() + alignment);
+                for (int i = 0; i < count; ++i) {
+                    const T expected = view.get(3 + i);
+                    require(std::memcmp(output.data() + alignment + i * sizeof(T), &expected, sizeof(T)) == 0,
+                            "Raw primitive transfer changed element bits");
+                }
+                for (std::size_t i = 0; i < output.size(); ++i)
+                    if (i < static_cast<std::size_t>(alignment) || i >= alignment + count * sizeof(T))
+                        require(output[i] == 0xa5, "Raw primitive transfer wrote outside its span");
+            }
+        }
+        if (plain) {
+            auto payload = static_cast<ConfinedPrimitiveArray<T>*>(source.get())->elements.get();
+            const T first = payload[0];
+            view.copy_to_bytes_unchecked(0, 33, payload + 1);
+            for (int i = 1; i <= 33; ++i)
+                require(std::memcmp(payload + i, &first, sizeof(T)) == 0,
+                        "Overlapping raw transfer changed ordered forward semantics");
+        }
+    }
+    PrimitiveArrayView<T>(nullptr).copy_to_bytes_unchecked(-1, 0, nullptr);
+}
 template<class Operation> void expect_copy_exception(const char* type, Operation operation) {
     bool caught = false;
     try { operation(); }
@@ -993,7 +1051,7 @@ template<class T> void mixed_bounded_copy_contracts(const char* descriptor) {
                     array_set<T>(source.get(), i, bounded_copy_sample<T>(i));
                     array_set<T>(target.get(), i, bounded_copy_sample<T>(i + 1));
                 }
-                if (count == 20) bounded_primitive_array_copy<T, 20>(source.get(), 3, target.get(), 5);
+                if (count == 20) bounded_primitive_array_copy<T, 20, 3>(source.get(), 3, target.get(), 5);
                 else if (count == 32) bounded_primitive_array_copy_inline<T, 32>(source.get(), 3, target.get(), 5);
                 else bounded_primitive_array_copy<T>(source.get(), 3, target.get(), 5, count);
                 for (std::int32_t i = 0; i < length; ++i) {
@@ -1015,6 +1073,16 @@ template<class T> void mixed_bounded_copy_contracts(const char* descriptor) {
                 T actual = array_get<T>(target.get(), i), expected = bounded_copy_sample<T>(i);
                 require(std::memcmp(&actual, &expected, sizeof(T)) == 0,
                         "Mixed bounded copy fallback changed payload bits");
+            }
+            for (std::int32_t to : {0, 3, 5, 23, 60}) {
+                for (std::int32_t i = 0; i < length; ++i) array_set<T>(source.get(), i, bounded_copy_sample<T>(i));
+                bounded_primitive_array_copy<T, 20, 3>(source.get(), 3, source.get(), to);
+                for (std::int32_t i = 0; i < length; ++i) {
+                    T expected = bounded_copy_sample<T>(i >= to && i < to + 20 ? i - to + 3 : i);
+                    T actual = array_get<T>(source.get(), i);
+                    require(std::memcmp(&actual, &expected, sizeof(T)) == 0,
+                            "Fixed source range changed a same-array copy");
+                }
             }
         }
     }
@@ -1491,6 +1559,14 @@ int main() {
         roots_and_cycles();
         root_addresses();
         contiguous_array_contracts();
+        raw_primitive_transfer_contracts<std::uint8_t>("[Z");
+        raw_primitive_transfer_contracts<std::int8_t>("[B");
+        raw_primitive_transfer_contracts<std::uint16_t>("[C");
+        raw_primitive_transfer_contracts<std::int16_t>("[S");
+        raw_primitive_transfer_contracts<std::int32_t>("[I");
+        raw_primitive_transfer_contracts<std::int64_t>("[J");
+        raw_primitive_transfer_contracts<float>("[F");
+        raw_primitive_transfer_contracts<double>("[D");
         array_descriptor_contracts();
         bounded_array_copy_contracts();
         confined_floating_read_contracts();
@@ -1520,6 +1596,7 @@ int main() {
         borrowed_reuse_race();
         monitor_contention();
         monitor_fast_path();
+        bounded_native_errors();
         require(jnative::add(INT32_MAX, std::int32_t(1)) == INT32_MIN, "int overflow");
         require(jnative::mul(INT64_MAX, std::int64_t(2)) == -2, "long overflow");
         std::cout << "runtime contracts passed; collections=" << jnative::Heap::instance().statistics().second << '\n';

@@ -1,6 +1,7 @@
 #pragma once
 #include "jn_diagnostics.hpp"
 #include "jn_common.hpp"
+#include "jn_primitive_transfer.hpp"
 #include "jn_platform.hpp"
 #include "jn_allocator.hpp"
 
@@ -25,7 +26,7 @@
 #include <functional>
 #include <chrono>
 #include <initializer_list>
-#if !defined(JNATIVE_PORTABLE_FLOAT_TO_INTEGER) && (defined(__x86_64__) || defined(_M_X64))
+#if defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
 #endif
 
@@ -207,6 +208,7 @@ class Heap {
     std::size_t collections_ = 0;
     std::atomic<std::size_t> allocations_{0};
     std::atomic<std::size_t> allocation_bytes_{0};
+    std::atomic<bool> shared_allocation_pressure_{false};
     std::size_t total_allocations_ = 0;
     std::size_t total_allocated_bytes_ = 0;
     std::size_t retained_bytes_ = 0;
@@ -249,12 +251,20 @@ public:
     // Keep context checks and page/queue growth outside the common path.
     JNATIVE_FORCEINLINE void before_allocation(ThreadContext* thread) {
         poll_if_requested();
-        const auto reported = allocations_.load(std::memory_order_relaxed);
         const auto threshold = threshold_.load(std::memory_order_relaxed);
-        const auto reported_bytes = allocation_bytes_.load(std::memory_order_relaxed);
         const auto byte_threshold = byte_threshold_.load(std::memory_order_relaxed);
-        const auto pending = thread->queued_allocations.load(std::memory_order_relaxed) - thread->reported_allocations;
-        const auto pending_bytes = thread->queued_bytes.load(std::memory_order_relaxed) - thread->reported_bytes;
+        const auto queued = thread->queued_allocations.load(std::memory_order_relaxed);
+        const auto queued_bytes = thread->queued_bytes.load(std::memory_order_relaxed);
+        // Before a second attachment, the global prefix and the mutator's
+        // partial batch add up to exactly this mutator's published totals.
+        if (!shared_allocation_pressure_.load(std::memory_order_acquire)) {
+            if (queued >= threshold || queued_bytes >= byte_threshold) collect();
+            return;
+        }
+        const auto reported = allocations_.load(std::memory_order_relaxed);
+        const auto reported_bytes = allocation_bytes_.load(std::memory_order_relaxed);
+        const auto pending = queued - thread->reported_allocations;
+        const auto pending_bytes = queued_bytes - thread->reported_bytes;
         if (reported >= threshold || pending >= threshold - reported
                 || reported_bytes >= byte_threshold || pending_bytes >= byte_threshold - reported_bytes)
             collect();
@@ -653,6 +663,17 @@ public:
 [[noreturn]] void raise(const char* type, const char* message = nullptr);
 [[noreturn]] void raise_with_message(const char* type, Object* message);
 [[noreturn]] void raise_native(const std::exception& error);
+
+// Bounded scalar imports keep their exception boundary while exposing the
+// native expression to the caller's optimizer. They cannot retain managed roots.
+template<class Call, class... Args>
+JNATIVE_FORCEINLINE auto invoke_bounded_native(Call&& call, Args... args) -> decltype(call(args...)) {
+    try {
+        return call(args...);
+    } catch (const Thrown&) { throw; }
+    catch (const std::bad_alloc&) { raise("java/lang/OutOfMemoryError"); }
+    catch (const std::exception& error) { raise_native(error); }
+}
 [[noreturn]] void throw_object(Object* object);
 void print_stack_trace(Object* object, Object* stream = nullptr);
 void add_suppressed(Object* object, Object* suppressed);
@@ -1240,14 +1261,19 @@ void array_copy(Object* source, std::int32_t source_offset, Object* target, std:
 namespace detail {
 // Ranges and Java kinds are validated by the caller. At least one payload is
 // confined; mixed representations cannot alias. Select storage outside the loop.
-template<class T> inline void copy_confined_primitive(Array* source, std::int32_t from,
+template<class T, std::int32_t FixedCount = -1> inline void copy_confined_primitive(Array* source, std::int32_t from,
         Array* target, std::int32_t to, std::int32_t count) {
     if (!count) return;
     if (source->array_kind == ConfinedPrimitiveArray<T>::kind) {
         auto input = static_cast<ConfinedPrimitiveArray<T>*>(source)->elements.get() + from;
         if (target->array_kind == ConfinedPrimitiveArray<T>::kind) {
             auto output = static_cast<ConfinedPrimitiveArray<T>*>(target)->elements.get() + to;
-            std::memmove(output, input, static_cast<std::size_t>(count) * sizeof(T));
+            // Distinct confined arrays own disjoint payloads. A constant byte
+            // count lets the compiler inline the small transfer.
+            constexpr std::size_t fixed_bytes = FixedCount > 0
+                ? static_cast<std::size_t>(FixedCount) * sizeof(T) : 0;
+            if (fixed_bytes && source != target) std::memcpy(output, input, fixed_bytes);
+            else std::memmove(output, input, static_cast<std::size_t>(count) * sizeof(T));
         } else {
             auto output = static_cast<PrimitiveArray<T>*>(target)->data() + to;
             for (std::int32_t i = 0; i < count; ++i) output[i].set(input[i]);
@@ -1258,7 +1284,7 @@ template<class T> inline void copy_confined_primitive(Array* source, std::int32_
         for (std::int32_t i = 0; i < count; ++i) output[i] = input[i].get();
     }
 }
-template<class T> inline bool primitive_array_copy_storage(Object* source, std::int32_t from,
+template<class T, std::int32_t FixedCount> JNATIVE_FORCEINLINE bool primitive_array_copy_storage_impl(Object* source, std::int32_t from,
         Object* target, std::int32_t to, std::int32_t count,
         OrdinaryField<T>*& input_elements, OrdinaryField<T>*& output_elements) {
     const char source_kind = require_non_null(source)->array_kind;
@@ -1275,7 +1301,7 @@ template<class T> inline bool primitive_array_copy_storage(Object* source, std::
             auto output = static_cast<Array*>(target);
             if (from < 0 || to < 0 || count < 0 || from > input->length - count || to > output->length - count)
                 raise("java/lang/ArrayIndexOutOfBoundsException");
-            copy_confined_primitive<T>(input, from, output, to, count);
+            copy_confined_primitive<T, FixedCount>(input, from, output, to, count);
             return false;
         }
         array_copy(source, from, target, to, count);
@@ -1288,6 +1314,11 @@ template<class T> inline bool primitive_array_copy_storage(Object* source, std::
     input_elements = input->data();
     output_elements = output->data();
     return true;
+}
+template<class T> inline bool primitive_array_copy_storage(Object* source, std::int32_t from,
+        Object* target, std::int32_t to, std::int32_t count,
+        OrdinaryField<T>*& input_elements, OrdinaryField<T>*& output_elements) {
+    return primitive_array_copy_storage_impl<T, -1>(source, from, target, to, count, input_elements, output_elements);
 }
 template<std::int32_t... Indices> struct PrimitiveArrayCopyIndices {};
 template<std::int32_t Count, std::int32_t... Indices> struct MakePrimitiveArrayCopyIndices
@@ -1311,6 +1342,7 @@ template<class T, std::int32_t Count> struct PrimitiveArrayCopyExpansion {
         (void)std::initializer_list<int>{(copy_element(output[Count - Indices - 1], copy_element(input[Count - Indices - 1])), 0)...};
     }
 };
+
 }
 // Generated callers prove 0 <= count <= 64 and retain both array roots.
 // Preserve array_copy's null, kind, bounds, overlap and atomic access semantics.
@@ -1335,7 +1367,7 @@ template<class T, std::int32_t Count> JNATIVE_FORCEINLINE void bounded_primitive
     static_assert(Count >= 0 && Count <= 32, "Constant primitive copy count must be between 0 and 32");
     OrdinaryField<T>* input_elements;
     OrdinaryField<T>* output_elements;
-    if (!detail::primitive_array_copy_storage(source, from, target, to, Count, input_elements, output_elements))
+    if (!detail::primitive_array_copy_storage_impl<T, Count>(source, from, target, to, Count, input_elements, output_elements))
         return;
     if (Count == 0) return;
     using Indices = typename detail::MakePrimitiveArrayCopyIndices<Count>::type;
@@ -1349,6 +1381,116 @@ template<class T, std::int32_t Count> inline void bounded_primitive_array_copy(O
         Object* target, std::int32_t to) {
     bounded_primitive_array_copy_inline<T, Count>(source, from, target, to);
 }
+
+// Count is guarded by the caller. The original copy handles a missed offset
+// hint and retains the Java null, type and range failure ordering.
+template<class T, std::int32_t Count, std::int32_t From> JNATIVE_FORCEINLINE void bounded_primitive_array_copy(
+        Object* source, std::int32_t from, Object* target, std::int32_t to) {
+    static_assert(Count > 0 && Count <= 32, "Fixed source range needs a positive small count");
+    static_assert(From >= 0 && From <= std::numeric_limits<std::int32_t>::max() - Count,
+            "Fixed source range must fit in a Java int");
+    constexpr auto source_end = From + Count;
+    // Widen before adding so a negative Java index cannot wrap into range.
+    const auto target_end = static_cast<std::uint64_t>(static_cast<std::uint32_t>(to)) + Count;
+    if (from == From && source && target) {
+        const auto kind = source->array_kind;
+        constexpr auto ordinary = PrimitiveArrayKind<T>::value;
+        constexpr auto confined = ConfinedPrimitiveArray<T>::kind;
+        if ((kind == ordinary || kind == confined) && target->array_kind == kind
+                && source_end <= static_cast<Array*>(source)->length
+                && target_end <= static_cast<std::uint32_t>(static_cast<Array*>(target)->length)
+                && (to >= source_end || target_end <= From || source != target)) {
+            if (kind == ordinary) {
+                using Indices = typename detail::MakePrimitiveArrayCopyIndices<Count>::type;
+                auto input = static_cast<PrimitiveArray<T>*>(source)->data() + From;
+                auto output = static_cast<PrimitiveArray<T>*>(target)->data() + to;
+                detail::PrimitiveArrayCopyExpansion<T, Count>::forward(input, output, Indices{});
+            } else {
+                auto input = static_cast<ConfinedPrimitiveArray<T>*>(source)->elements.get() + From;
+                auto output = static_cast<ConfinedPrimitiveArray<T>*>(target)->elements.get() + to;
+                std::memcpy(output, input, Count * sizeof(T));
+            }
+            return;
+        }
+    }
+    bounded_primitive_array_copy<T, Count>(source, from, target, to);
+}
+
+namespace detail {
+template<int Base, int... Lanes> struct FloatGroupMask;
+template<int Base> struct FloatGroupMask<Base> : std::integral_constant<unsigned, 0> {};
+template<int Base, int Lane, int... Rest>
+struct FloatGroupMask<Base, Lane, Rest...> : std::integral_constant<unsigned,
+        (Lane >= Base && Lane < Base + 4 ? 1u << (Lane % 4) : 0u) | FloatGroupMask<Base, Rest...>::value> {};
+
+#if defined(__x86_64__) || defined(_M_X64)
+template<int Base, int Lane>
+JNATIVE_FORCEINLINE void patch_float_group(__m128i& group, float value) {
+    if (Lane >= Base && Lane < Base + 4) {
+        const auto bits = _mm_castps_si128(_mm_set_ss(value));
+        group = _mm_or_si128(group, _mm_slli_si128(bits, (Lane % 4) * sizeof(float)));
+    }
+}
+#else
+template<int Base, int Lane>
+JNATIVE_FORCEINLINE void patch_float_group(float* group, float value) {
+    if (Lane >= Base && Lane < Base + 4) std::memcpy(group + Lane % 4, &value, sizeof(float));
+}
+#endif
+
+template<int Base, int... Lanes, class... Values>
+JNATIVE_FORCEINLINE void store_float_group(float* source, float* target, Values... values) {
+    constexpr unsigned mask = FloatGroupMask<Base, Lanes...>::value;
+    if (mask == 0) {
+        std::memcpy(target + Base, source + Base, 4 * sizeof(float));
+        return;
+    }
+#if defined(__x86_64__) || defined(_M_X64)
+    const auto unchanged = _mm_loadu_ps(source + Base);
+    const auto changed = _mm_setr_epi32(mask & 1 ? -1 : 0, mask & 2 ? -1 : 0,
+            mask & 4 ? -1 : 0, mask & 8 ? -1 : 0);
+    auto group = _mm_andnot_si128(changed, _mm_castps_si128(unchanged));
+    const int updates[] = {0, (patch_float_group<Base, Lanes>(group, values), 0)...};
+    (void)updates;
+    _mm_storeu_ps(source + Base, _mm_castsi128_ps(group));
+    _mm_storeu_ps(target + Base, _mm_castsi128_ps(group));
+#else
+    float group[4];
+    std::memcpy(group, source + Base, sizeof(group));
+    const int updates[] = {0, (patch_float_group<Base, Lanes>(group, values), 0)...};
+    (void)updates;
+    std::memcpy(source + Base, group, sizeof(group));
+    std::memcpy(target + Base, group, sizeof(group));
+#endif
+}
+
+template<int... Lanes, int... Groups, class... Values>
+JNATIVE_FORCEINLINE void store_float_groups(float* source, float* target,
+        std::integer_sequence<int, Groups...>, Values... values) {
+    const int writes[] = {0, (store_float_group<4 * Groups, Lanes...>(source, target, values...), 0)...};
+    (void)writes;
+}
+}
+
+// Only the compiler's verified store/copy shape calls this helper. A failed
+// guard leaves the arrays untouched so Java's original stores can still throw
+// after committing earlier lanes.
+template<int Count, int... Lanes, class... Values>
+JNATIVE_FORCEINLINE bool try_packed_float_copy(Object* source, std::int32_t from,
+        Object* target, std::int32_t to, Values... values) {
+    static_assert(Count >= 4 && Count <= 32 && Count % 4 == 0, "Invalid packed float count");
+    static_assert(sizeof...(Lanes) == sizeof...(Values), "Each packed lane requires a value");
+    using Array = ConfinedPrimitiveArray<float>;
+    if (!source || !target || source == target || source->array_kind != Array::kind
+            || target->array_kind != Array::kind) return false;
+    const auto input = static_cast<Array*>(source);
+    const auto output = static_cast<Array*>(target);
+    if (from < 0 || to < 0 || from > input->length - Count || to > output->length - Count) return false;
+    detail::store_float_groups<Lanes...>(input->elements.get() + from, output->elements.get() + to,
+            std::make_integer_sequence<int, Count / 4>{}, values...);
+    return true;
+}
+
 Object* array_clone(Object* source);
 Object* array_copy_of(Object* source, std::int32_t length);
 template<class T> PrimitiveArray<T>* primitive_array(Object* object) {
@@ -1426,6 +1568,18 @@ public:
     void set_unchecked(std::int32_t index, T value) const {
         if (MayBeConfined && confined_) static_cast<T*>(elements_)[index] = value;
         else static_cast<OrdinaryField<T>*>(elements_)[index].set(value);
+    }
+    // Raw native transfer with the same ordered reads as repeated get_unchecked.
+    // The caller proves source range and writable destination capacity, retains
+    // this array's root, and keeps the byte storage alive for the entire call.
+    // Position, byte order and ownership of the destination remain caller-owned.
+    void copy_to_bytes_unchecked(std::int32_t offset, std::int32_t count, void* destination) const {
+        if (!count) return;
+        auto output = static_cast<std::uint8_t*>(destination);
+        if (MayBeConfined && confined_)
+            detail::transfer_elements<T, true, false>(static_cast<T*>(elements_) + offset, output, count);
+        else
+            detail::transfer_elements<T, true, false>(static_cast<OrdinaryField<T>*>(elements_) + offset, output, count);
     }
     T get(std::int32_t index) const {
         if (static_cast<std::uint32_t>(index) >= length_) fail(object_);

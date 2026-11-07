@@ -43,6 +43,39 @@ class OwnedArraysTest {
                                 private final float[] values = new float[2];
                                 float[] expose() { return values; }
                             }
+                            static class Prepared {
+                                private final float[] values = new float[2];
+                                float[] update(boolean change) {
+                                    if (!change) return values;
+                                    values[0] += 7;
+                                    return values;
+                                }
+                            }
+                            static class ReturnedShared {
+                                private final float[] values = new float[2];
+                                float[] update() { values[0]++; return values; }
+                            }
+                            static class ConfinedTransfer {
+                                private final float[] source = new float[20], target = new float[20];
+                                void copyDistinct() {
+                                    source[0] = -0.0f;
+                                    source[1] = Float.intBitsToFloat(0x7fc01234);
+                                    for (int i = 2; i < source.length; i++) source[i] = i + 1;
+                                    System.arraycopy(source, 0, target, 0, 8);
+                                }
+                                void copyOverlap() {
+                                    System.arraycopy(target, 0, target, 1, 8);
+                                    System.arraycopy(target, 1, target, 0, 8);
+                                }
+                                int bits(int index) { return Float.floatToRawIntBits(target[index]); }
+                            }
+                            static class Ambiguous {
+                                private final float[] first = new float[1], second = new float[1];
+                                float[] select(boolean choice) {
+                                    if (choice) return first;
+                                    return second;
+                                }
+                            }
                             static class Internal {
                                 final int[] values = new int[2];
                                 void fill() { for (int i = 0; i < values.length; i++) values[i] = i + 1; }
@@ -95,6 +128,22 @@ class OwnedArraysTest {
                                 AliasChild inherited = new AliasChild(); inherited.expose()[0] = 123; System.out.println(inherited.values[0]);
                                 published = inherited.expose();
                                 System.out.println(Float.floatToRawIntBits(escaped.expose()[1]));
+                                Prepared prepared = new Prepared();
+                                float[] copied = new float[2];
+                                System.arraycopy(prepared.update(true), 0, copied, 0, copied.length);
+                                System.out.println(copied[0] + ":" + prepared.update(false)[0]);
+                                ConfinedTransfer transfer = new ConfinedTransfer();
+                                transfer.copyDistinct();
+                                System.out.println(transfer.bits(0) + ":" + transfer.bits(1) + ":" + transfer.bits(7));
+                                transfer.copyOverlap();
+                                System.out.println(transfer.bits(0) + ":" + transfer.bits(1) + ":" + transfer.bits(7)
+                                        + ":" + transfer.bits(8));
+                                ReturnedShared returned = new ReturnedShared();
+                                published = returned.update();
+                                System.out.println(((float[]) published)[0]);
+                                Ambiguous ambiguous = new Ambiguous();
+                                ambiguous.select(true)[0] = 13;
+                                System.out.println(ambiguous.select(true)[0] + ":" + ambiguous.select(false)[0]);
                                 System.out.println(new Aliased().run());
                                 Shared shared = new Shared(); shared.add();
                                 Thread worker = new Thread(() -> {
@@ -138,6 +187,11 @@ class OwnedArraysTest {
                                 .resolve("array-ownership.tsv"));
         assertTrue(report.contains("Ownership$Owned.values[F\tplain"), report);
         assertFalse(report.contains("Ownership$Escaped."), report);
+        assertTrue(report.contains("Ownership$Prepared.values[F\tplain"), report);
+        assertTrue(report.contains("Ownership$ConfinedTransfer.source[F\tplain"), report);
+        assertTrue(report.contains("Ownership$ConfinedTransfer.target[F\tplain"), report);
+        assertFalse(report.contains("Ownership$ReturnedShared."), report);
+        assertFalse(report.contains("Ownership$Ambiguous."), report);
         assertTrue(report.contains("Ownership$Internal.values[I\tplain"), report);
         assertFalse(report.contains("Ownership$AliasParent."), report);
         assertFalse(report.contains("Ownership$Shared."), report);

@@ -6,6 +6,22 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class NativeDiagnosticsMappingTest {
     @Test
+    void sharedInlineDefinitionsKeepTheirOwnVerifiedClassAndRanges() throws Exception {
+        var first = new LinkedHashMap<>(mapping("game.First", "::generated::game::First", 10, 20));
+        var second = new LinkedHashMap<>(mapping("game.Second", "::generated::game::Second", 30, 40));
+        first.put("cppFile", "java_inline.hpp");
+        second.put("cppFile", "java_inline.hpp");
+        var sourceMap = Map.<String, Object>of("classes", List.of(), "inlineClasses", List.of(first, second));
+        var selected = annotate(sourceMap, "src/java_inline.hpp", "hash", 35, "??");
+        assertEquals("game.Second", selected.get("javaClass"));
+        assertEquals("::generated::game::Second::apply", selected.get("function"));
+        assertFalse(annotate(sourceMap, "src/java_inline.hpp", "hash", 25, "??").containsKey("javaClass"));
+        var stale = annotate(sourceMap, "src/java_inline.hpp", "edited", 35, "??");
+        assertEquals("stale-after-native-edit", stale.get("javaMappingStatus"));
+        assertFalse(stale.containsKey("javaClass"));
+    }
+
+    @Test
     void sharedSourcesSelectVerifiedMethodOwnerAndNeverGuessAfterEdits() throws Exception {
         var parent = mapping("game.Parent", "::generated::game::Parent", 10, 20);
         var lambda = mapping("game.Parent$jNativeLambda$0", "::generated::game::Parent::Lambda0", 30, 40);
@@ -32,12 +48,17 @@ class NativeDiagnosticsMappingTest {
 
     private static Map<String, Object> annotate(Map<String, Object> sourceMap, String hash,
             int line, String function) throws Exception {
+        return annotate(sourceMap, "src/classes/game/Parent.cpp", hash, line, function);
+    }
+
+    private static Map<String, Object> annotate(Map<String, Object> sourceMap, String source, String hash,
+            int line, String function) throws Exception {
         var location = new LinkedHashMap<String, Object>();
-        location.put("location", "src/classes/game/Parent.cpp:" + line + ":1");
+        location.put("location", source + ":" + line + ":1");
         location.put("function", function);
         var annotate = NativeDiagnostics.class.getDeclaredMethod("annotateLocation", Map.class, Map.class, Map.class);
         annotate.setAccessible(true);
-        annotate.invoke(null, location, sourceMap, Map.of("src/classes/game/Parent.cpp", hash));
+        annotate.invoke(null, location, sourceMap, Map.of(source, hash));
         return location;
     }
 }

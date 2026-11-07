@@ -77,6 +77,7 @@ public final class CppBackend implements NativeBackend {
                             "jn_platform_windows.cpp",
                             "jn_platform_linux.cpp",
                             "jn_runtime.hpp",
+                            "jn_primitive_transfer.hpp",
                             "jn_allocator.hpp",
                             "jn_allocator.cpp",
                             "jn_arrays.hpp",
@@ -436,6 +437,14 @@ public final class CppBackend implements NativeBackend {
                             Release probes interprocedural optimization so the compiler can inline across
                             separate class files. JNATIVE_IPO=AUTO enables it when the toolchain supports it;
                             ON requires support, and OFF disables it. Debug keeps IPO disabled.
+                            Proven bounded internal entries are defined in java_inline.hpp for direct
+                            visibility across generated units. source-map.json maps these definitions
+                            through inlineClasses. Java-frame tracing retains ordinary class definitions.
+                            heap-effects.tsv records analyzed call bodies' field/array writes and barriers
+                            used to invalidate cached reads after initialization and safepoint proofs.
+                            Size-budgeted nonrecursive implementations also live in java_inline.hpp.
+                            Their ordinary wrappers preserve the C++ callable surface. Implementations
+                            retain all original root publication, polls, checks and initialization.
                             jnative-optimization.properties records the configured result.
                             reflection.cpp contains reflection metadata/adapters; reflection.tsv records
                             the explicit build registrations.
