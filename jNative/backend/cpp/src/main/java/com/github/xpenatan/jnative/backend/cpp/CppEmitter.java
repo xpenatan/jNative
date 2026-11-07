@@ -58,13 +58,16 @@ public final class CppEmitter implements Opcodes {
     private CppNames names;
     private MethodEffects methodEffects;
     private ClassInitializationEffects classInitializationEffects;
+    private final Map<MethodId, Optional<PrimitiveInline>> primitiveInlines = new HashMap<>();
     private CallTargets callTargets;
+    private PrimitiveCopyCounts primitiveCopyCounts;
     private OwnedArrays ownedArrays;
     private Map<MethodId, List<ArrayStorage.Mode>> arrayInputs;
     private ArrayBorrowing arrayBorrowing;
     private ReferenceStores referenceStores;
     private Set<MethodId> initializedEntries = Set.of();
     private Set<MethodId> inlineInitializedEntries = Set.of();
+    private Set<MethodId> initializedDependencyEntries = Set.of();
     private Set<MethodId> protectedCallbackTargets = Set.of();
     private final Map<String, Integer> classIds = new HashMap<>();
     private final Map<String, Integer> stringLiterals = new LinkedHashMap<>();
@@ -93,13 +96,17 @@ public final class CppEmitter implements Opcodes {
                 ? Map.<MethodId, SubstitutionRegistry.MethodOrigin>of() : program.substitutions().methodOrigins();
         this.names = new CppNames(program, request.sourceLayout());
         this.callTargets = new CallTargets(program);
+        this.primitiveCopyCounts = new PrimitiveCopyCounts(program,
+                call -> verifiedArraycopy(call) && !smallConstantCopy(call), this::directGeneratedTarget);
         this.arrayBorrowing = new ArrayBorrowing(program);
         this.ownedArrays = new OwnedArrays(program, arrayBorrowing);
         this.arrayInputs = ArrayStorage.inputs(program, ownedArrays, arrayBorrowing);
         this.referenceStores = new ReferenceStores(program, ownedArrays);
         this.classInitializationEffects = new ClassInitializationEffects(program);
+        primitiveInlines.clear();
         initializedEntries = Set.of();
         inlineInitializedEntries = Set.of();
+        initializedDependencyEntries = Set.of();
         protectedCallbackTargets = Set.of();
         classIds.clear();
         stringLiterals.clear();
@@ -265,7 +272,10 @@ public final class CppEmitter implements Opcodes {
                 methodEffects.validatedArgumentProtection(id, readable.protectsArguments());
         });
         Set<MethodId> tailLowerings = methodEffects.tailLowerings();
-        initializedEntries = initializedEntryTargets(validatedReadable);
+        initializedDependencyEntries = initializedDependencyTargets(validatedReadable);
+        Set<MethodId> entries = new HashSet<>(initializedEntryTargets(validatedReadable));
+        entries.addAll(initializedDependencyEntries);
+        initializedEntries = Set.copyOf(entries);
         inlineInitializedEntries = inlineInitializedEntryTargets(initializedEntries);
         names.registerInitializedMethods(program, initializedEntries);
         Map<MethodId, ReadableMethodEmitter.Result> finalizedReadable = new HashMap<>();
@@ -310,6 +320,7 @@ public final class CppEmitter implements Opcodes {
         if(initializedLoweringFailed) {
             initializedEntries = Set.of();
             inlineInitializedEntries = Set.of();
+            initializedDependencyEntries = Set.of();
             names.registerInitializedMethods(program, initializedEntries);
             initializedReadable.clear();
             for(Program.Method candidate : program.methods().values()) {
@@ -1834,7 +1845,7 @@ public final class CppEmitter implements Opcodes {
                         .append(')')
                         .append(abstractMethod ? " = 0;\n" : ";\n");
                 if(initializedEntries.contains(m.id()))
-                    declaration.append("    static ")
+                    declaration.append((m.bytecode().access & ACC_STATIC) != 0 ? "    static " : "    ")
                             .append(inlineInitializedEntry(m.id()) ? "JNATIVE_INLINE_ENTRY " : "")
                             .append(type(Type.getReturnType(m.id().descriptor()))).append(' ')
                             .append(names.initializedMethod(m.id())).append('(')
@@ -2356,6 +2367,11 @@ public final class CppEmitter implements Opcodes {
         return callTargets.direct(call);
     }
 
+    PrimitiveInline primitiveInline(MethodId target) {
+        return primitiveInlines.computeIfAbsent(target,
+                id -> Optional.ofNullable(PrimitiveInline.analyze(program.methods().get(id)))).orElse(null);
+    }
+
     boolean preservesReferenceReads(MethodId caller, MethodInsnNode call) {
         if(!boundedCall(caller, call) || call.name.startsWith("<")) return false;
         MethodId target = call.getOpcode() == INVOKESTATIC || call.getOpcode() == INVOKESPECIAL
@@ -2536,9 +2552,47 @@ public final class CppEmitter implements Opcodes {
         return Set.copyOf(called);
     }
 
-    boolean initializedCall(MethodId caller, MethodInsnNode call, MethodId declaration) {
-        return call.getOpcode() == INVOKESTATIC && initializedEntries.contains(declaration)
-                && caller.owner().equals(declaration.owner())
+    private Set<MethodId> initializedDependencyTargets(
+            Map<MethodId, ReadableMethodEmitter.Result> validatedReadable) {
+        Set<MethodId> bounded = new HashSet<>();
+        for(Program.Method target : program.methods().values()) {
+            var readable = validatedReadable.get(target.id());
+            var bytecode = target.bytecode();
+            if(readable == null || readable.source() == null || target.nativeSymbol() != null
+                    || readable.source().length() > 32768 || (bytecode.access & ACC_SYNCHRONIZED) != 0
+                    || target.id().name().startsWith("<") || isInterface(target.id().owner())
+                    || ((bytecode.access & ACC_STATIC) != 0 && !emptyInitialization(target.id().owner()))
+                    || !bytecode.tryCatchBlocks.isEmpty()
+                    || !methodEffects.boundedAfterInitialization(target.id())
+                    || initializationDependencies(target.id()).isEmpty())
+                continue;
+            bounded.add(target.id());
+        }
+        Set<MethodId> called = new HashSet<>();
+        for(Program.Method caller : program.methods().values()) {
+            Set<String> initialized = methodEffects.delegatesRoots(caller.id())
+                    ? delegationInitializationDependencies(caller.id()) : initializationDependencies(caller.id());
+            if(initialized.isEmpty()) continue;
+            for(AbstractInsnNode instruction : caller.bytecode().instructions) {
+                if(!(instruction instanceof MethodInsnNode call)) continue;
+                MethodId target = directGeneratedTarget(call);
+                if(bounded.contains(target) && initialized.containsAll(initializationDependencies(target)))
+                    called.add(target);
+            }
+        }
+        return Set.copyOf(called);
+    }
+
+    boolean initializedDependencyEntry(MethodId method) {
+        return initializedDependencyEntries.contains(method);
+    }
+
+    boolean initializedCall(MethodId caller, MethodInsnNode call, MethodId declaration,
+                            Set<String> initialized) {
+        if(!initializedEntries.contains(declaration)) return false;
+        if(initializedDependencyEntry(declaration))
+            return initialized.containsAll(initializationDependencies(declaration));
+        return call.getOpcode() == INVOKESTATIC && caller.owner().equals(declaration.owner())
                 && (program.methods().get(caller).bytecode().access & ACC_STATIC) != 0;
     }
 
@@ -2546,10 +2600,12 @@ public final class CppEmitter implements Opcodes {
         // Only initializedCall emits calls to these internal entries. Its exact
         // owner rule keeps their callers and definitions in the same class source.
         Set<MethodId> result = new HashSet<>(candidates);
+        // Dependency entries can be selected by a caller in another translation unit.
+        result.removeAll(initializedDependencyEntries);
         for(MethodId id : candidates)
             for(AbstractInsnNode instruction : program.methods().get(id).bytecode().instructions)
                 if(instruction instanceof MethodInsnNode call && boundedArraycopy(call)
-                        && constantCopyCount(call) <= 32) {
+                        && trailingIntLiteral(call) <= 32) {
                     // Fixed payload expansion can multiply code in every caller.
                     // Reuse the intrinsic/count proof, including its binding identity.
                     result.remove(id);
@@ -2667,8 +2723,8 @@ public final class CppEmitter implements Opcodes {
         return ownedArrays.instructions(method);
     }
 
-    Set<AbstractInsnNode> confinedArrayInstructions(Program.Method method) {
-        return ConfinedArrays.analyze(method.id().owner(), method.bytecode(), arrayBorrowing);
+    ConfinedArrays.Facts confinedArrayFacts(Program.Method method) {
+        return ConfinedArrays.facts(method.id().owner(), method.bytecode(), arrayBorrowing);
     }
 
     ArrayStorage.Facts arrayStorage(Program.Method method, Set<AbstractInsnNode> confined) {
@@ -2728,6 +2784,12 @@ public final class CppEmitter implements Opcodes {
         return verifiedArraycopy(call) && smallConstantCopy(call);
     }
 
+    PackedFloatCopy packedFloatCopy(Program.Method method) {
+        return method != null && method.id().descriptor().startsWith("([FI[FI")
+                && emptyInitialization(method.id().owner())
+                ? PackedFloatCopy.match(program, method, this::verifiedArraycopy) : null;
+    }
+
     private boolean verifiedArraycopy(MethodInsnNode call) {
         if(call.getOpcode() != INVOKESTATIC || !call.owner.equals("java/lang/System")
                 || !call.name.equals("arraycopy") || !call.desc.equals("(Ljava/lang/Object;ILjava/lang/Object;II)V")) return false;
@@ -2739,7 +2801,15 @@ public final class CppEmitter implements Opcodes {
                 && NativeBinding.trivialInitialization(program.classes().get(target.helper().owner()));
     }
 
-    record GuardedPrimitiveCopy(String fast, String slow) {
+    private MethodId directGeneratedTarget(MethodInsnNode call) {
+        if(program.platform(call.owner)) return null;
+        return switch(call.getOpcode()) {
+            case INVOKESTATIC, INVOKESPECIAL -> resolve(call.owner, call.name, call.desc);
+            default -> directTarget(call);
+        };
+    }
+
+    record GuardedPrimitiveCopy(String fast, String slow, int preferredCount, String fixed) {
     }
 
     /** Separate arms only for the verified adapter and equal, precise primitive array kinds. */
@@ -2754,10 +2824,13 @@ public final class CppEmitter implements Opcodes {
         if(element == null) return null;
         PlatformBindings.Target target = program.bindings().find(
                 new MethodId(call.owner, call.name, call.desc));
+        int count = primitiveCopyCounts.preferred(call);
+        String fixed = count == 0 ? null : "::jnative::bounded_primitive_array_copy<" + element + ", "
+                + count + ">(" + String.join(", ", args.subList(0, 4)) + ")";
         return new GuardedPrimitiveCopy(
                 "::jnative::bounded_primitive_array_copy<" + element + ">(" + String.join(", ", args) + ")",
                 className(target.helper().owner()) + "::" + memberName(target.helper())
-                        + "(" + String.join(", ", args) + ")");
+                        + "(" + String.join(", ", args) + ")", count, fixed);
     }
 
     private static String primitiveCopyElement(Type array) {
@@ -2775,11 +2848,11 @@ public final class CppEmitter implements Opcodes {
     }
 
     private static boolean smallConstantCopy(MethodInsnNode call) {
-        int value = constantCopyCount(call);
+        int value = trailingIntLiteral(call);
         return value >= 0 && value <= 64;
     }
 
-    private static int constantCopyCount(MethodInsnNode call) {
+    static int trailingIntLiteral(MethodInsnNode call) {
         AbstractInsnNode count = call.getPrevious();
         while(count instanceof LineNumberNode || count instanceof FrameNode)
             count = count.getPrevious();
@@ -2904,7 +2977,7 @@ public final class CppEmitter implements Opcodes {
                         && source.getSort() == Type.ARRAY && source.getDimensions() == 1) {
                     String element = primitiveCopyElement(source);
                     if(element != null) {
-                        int fixedCount = constantCopyCount(call);
+                        int fixedCount = trailingIntLiteral(call);
                         if(boundedCopy && fixedCount >= 0 && fixedCount <= 32)
                             direct = "::jnative::" + (copyBoundary
                                     ? "bounded_primitive_array_copy_inline" : "bounded_primitive_array_copy")

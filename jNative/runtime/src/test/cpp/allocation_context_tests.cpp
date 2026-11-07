@@ -146,6 +146,26 @@ void pressure(Heap& heap) {
     allocate<Cell>();
     require(heap.statistics().second == collections + 1 && heap.statistics().first == 1,
             "Thread detach lost the partial allocation batch");
+
+    bool reattached_pressure = false;
+    std::thread reattacher([&] {
+        Heap isolated;
+        ThreadContext first, second;
+        isolated.attach(&first);
+        isolated.collection_threshold(65);
+        for (int i = 0; i < 48; ++i) allocate<Cell>();
+        isolated.detach(&first);
+        isolated.attach(&second);
+        for (int i = 0; i < 17; ++i) allocate<Cell>();
+        const auto full = isolated.statistics();
+        allocate<Cell>();
+        const auto collected = isolated.statistics();
+        reattached_pressure = full.first == 65 && full.second == 0
+                && collected.first == 1 && collected.second == 1;
+        isolated.detach(&second);
+    });
+    { NativeRegion waiting; reattacher.join(); }
+    require(reattached_pressure, "Reattached mutator ignored pressure from a previous attachment");
 }
 
 void concurrent_pressure(Heap& heap) {
