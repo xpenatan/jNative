@@ -64,6 +64,7 @@ public final class CppEmitter implements Opcodes {
     private PrimitiveCopyCounts primitiveCopyCounts;
     private OwnedArrays ownedArrays;
     private Map<MethodId, List<ArrayStorage.Mode>> arrayInputs;
+    private Set<AbstractInsnNode> fallbackConfinedArrays = Set.of();
     private ArrayBorrowing arrayBorrowing;
     private ReferenceStores referenceStores;
     private Set<MethodId> initializedEntries = Set.of();
@@ -755,6 +756,12 @@ public final class CppEmitter implements Opcodes {
     }
 
     private void emitMethod() {
+        // Call-site storage facts include local confinement even when this body
+        // needs low-level emission. Honor the same allocation proof so a typed
+        // callee view agrees with the array representation produced here.
+        fallbackConfinedArrays = new HashSet<>(ownedArrays.instructions(method.id()));
+        if(method.nativeSymbol() == null)
+            fallbackConfinedArrays.addAll(confinedArrayFacts(method).origins().keySet());
         line("// " + comment(method.id().toString()));
         line(memberSignature(method, true) + " {");
         if((method.bytecode().access & ACC_STATIC) == 0 && !isInterface(method.id().owner()))
@@ -1019,7 +1026,7 @@ public final class CppEmitter implements Opcodes {
             push(
                     size - 1,
                     Type.getType(Object.class),
-                    (ownedArrays.instructions(method.id()).contains(instruction)
+                    (fallbackConfinedArrays.contains(instruction)
                             ? "::jnative::new_confined_array<"
                             + primitiveArrayStorage(descriptor)
                             + ">("

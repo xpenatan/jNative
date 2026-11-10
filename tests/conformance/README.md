@@ -1,4 +1,216 @@
-# Isolated performance comparisons
+# Project-owned implementation comparisons
+
+The workloads and runners belong to this repository. They require no game
+framework, renderer, graphics driver, sibling checkout, external application
+executable, or another project's build helper. Comparators are jNative,
+GraalVM Native Image and equivalent standalone C++.
+
+The default `all` selection runs ten suites: **59 operations and 166 default
+size combinations**. The `general` suite covers integer arithmetic, interface dispatch,
+reference and typed-array allocation, list/map growth, cold string hashing, and
+string searches. String input preparation and output are outside measured
+regions; allocation and collection growth remain timed when those are the
+operation being measured.
+
+The current runner requires Windows, MSVC, CMake and GraalVM Native Image.
+Create `tests/conformance/build/comparison-tools.properties` with installed tools:
+
+```properties
+generator=Visual Studio 18 2026
+vcvars=C:/path/to/Visual Studio/VC/Auxiliary/Build/vcvars64.bat
+nativeImage=C:/path/to/graalvm/bin/native-image.cmd
+```
+
+Run from the repository root, choosing a new run name each time:
+
+```text
+gradlew.bat :tests:conformance:compareImplementations -PcomparisonTools=<absolute-properties-path> -PcomparisonRun=full-01
+```
+
+This task builds the same fixture bytecode with jNative and Native Image, builds
+its C++ counterpart, and verifies results before timing. It checks independent
+small inputs, fixture hashes, JVM checksums for every measured size/round count,
+and every measured sample. A verification failure stops the comparison.
+
+Outputs stay under the owning module's configured build directory:
+`compare/<run>/`. In `all` mode, `suite-status.csv` records every selected suite's
+case count, PASS/FAIL, elapsed time, result path and failure-log path. Individual
+suites live in short numbered subdirectories. A failed suite does not prevent
+the others from running; any failed suite makes the overall task fail.
+Short build subdirectories keep native paths within Windows limits.
+For a single-suite run, `benchmark.properties` records inputs;
+`measurements/timings.csv` contains raw milliseconds for each implementation;
+`samples.csv` and `summary.csv` in that directory contain samples and median
+ranges. `verification.txt` records the checks. These are temporary execution
+outputs; the persistent performance history is `.performance/HISTORY.md` at the
+repository root.
+
+Full runs also write every selected case to one searchable HTML table and one
+combined CSV, including failed suites and duration warnings. Regenerate those
+outputs from a completed full run without repeating measurements:
+
+```text
+gradlew.bat :tests:conformance:reportComparison -PcomparisonRun=full-01
+```
+
+Open `build/compare/full-01/all-cases.html`; the complete raw table is also in
+`all-cases.csv`. The report retains original and tuned C++ columns separately,
+uses the actual calibrated rounds, and refuses incomplete or duplicate timing
+rows from a supposedly successful suite. Failed suites retain every selected
+case with blank timings and an explicit status. The report reads a completed
+run and does not execute benchmarks or change the measurements.
+
+The case label combines suite, operation and numeric size, for example
+`map-probe:get-string:4096`. For map-probe lookups, the report also shows
+`LookupCount` (size × measured rounds) and nanoseconds per lookup for each
+implementation. Use those units to compare sizes with different work counts.
+
+The default uses three processes per implementation, three warmups and five
+samples per process, CPU affinity 1, and alternating implementation order. Each
+suite's builds finish before its calibration and measurements. Suites execute
+sequentially, so no compilation overlaps measured work. Each sample loops over the selected
+operation many times; it is not a single operation timing.
+
+`compareImplementations` first runs separate calibration pilots on every
+implementation, including an optional prior jNative control. It chooses one
+shared round count per case, targeting at least **100 ms** for the fastest
+implementation's median sample. Three pilot samples and the usual warmups run
+per pilot process. Pilot samples are never included in the reported results.
+The JVM verifies checksums for every changed round count before it is timed.
+
+Calibration uses a **2,000 ms** slowest-implementation pilot budget, at most six
+attempts, bounded round growth and a **64 MiB** conservative estimate for
+cold-hashing inputs that grow with rounds. These are calibration limits, not
+hard bounds on process memory or execution time. If a limit prevents reaching
+the target, `timings.csv` explicitly reports `below-target` with its reason.
+Measured duration status uses the minimum process-median sample across all
+implementations; a noisy run can fall below target even after successful pilots.
+Do not treat such a row as having met the requested timing duration.
+
+Configure repetition with:
+
+| Property | Default | Purpose |
+| --- | ---: | --- |
+| `comparisonMinSampleMillis` | 100 | Target duration for the fastest implementation |
+| `comparisonMaxSampleMillis` | 2000 | Pilot budget for the slowest implementation |
+| `comparisonMaxSetupMiB` | 64 | Estimated round-scaled cold-hash input budget |
+| `comparisonCalibrate` | true | Set false to retain explicitly configured/default rounds |
+
+`measurements/calibration.csv` records pilot counts and timings.
+`resolved-configuration.properties` in the same directory records the exact
+chosen counts, and `timings.csv` includes `Rounds`, `TargetSampleMs` and
+`DurationStatus`. To replay exactly those counts, copy the resolved properties
+to a new file, set a new `runName` and `calibration.enabled=false`, then use the
+`benchmarkScores -PbenchmarkConfig=<absolute-properties-path>` task. Legacy
+benchmark configuration files keep their round counts unless they opt in with
+`calibration.enabled=true`.
+
+Select operations with
+`-PcomparisonCases=arithmetic:256` or
+`-PcomparisonCases=(dispatch|arithmetic):.*`. Set `-PcomparisonProcesses=6` for
+a longer comparison. To include a named prior jNative binary, set
+`-PcomparisonBaseline=<absolute-executable-path>` using the same fixture and
+settings and select a single suite with `-PcomparisonSuite=<suite>`.
+Other implementations remain required comparisons.
+
+In Windows PowerShell, preserve regular-expression metacharacters when invoking
+the batch wrapper by using its stop-parsing token and double quotes:
+
+```powershell
+.\gradlew.bat --% :tests:conformance:compareImplementations -PcomparisonTools=E:/path/to/comparison-tools.properties -PcomparisonRun=repeat-01 "-PcomparisonCases=(arithmetic:256|search-prefix:16)"
+```
+
+Select independent probes with `-PcomparisonSuite=<suite>`:
+
+| Suite | Operations | Default cases | Measured work |
+| --- | ---: | ---: | --- |
+| `general` | 9 | 27 | Arithmetic, dispatch, allocation, collections, strings |
+| `numeric` | 6 | 12 | Field updates, table lookups, packing and a numeric pipeline |
+| `transfer` | 3 | 9 | Primitive-array and typed-buffer transfers |
+| `allocation` | 6 | 18 | Dropped/retained objects, graphs and arrays |
+| `lookup` | 6 | 18 | Hashing, map hits/misses/replacement and reference scanning |
+| `map-probe` | 13 | 39 | Typed/erased/identity hashing and collision groups |
+| `map-growth` | 4 | 12 | Boxing, presizing and table growth |
+| `map-iteration` | 3 | 9 | Dense/sparse hash and linked-map iteration |
+| `nested-array` | 4 | 12 | Nested versus flat array traversal |
+| `runtime-cost` | 5 | 10 | Reference stores and scalar/bulk buffer access |
+| Total | 59 | 166 | Each operation may have several sizes |
+
+Use `-PcomparisonSuite=all` (the default) for the full selection or name one suite
+for focused work. Case filters apply to each suite's operation and size; suites
+with no matching cases are not selected. A suite marked PASS has completed its
+checksum-verified matrix; inspect each row's duration flag separately. Current
+admission results and unresolved failures belong in `.performance/HISTORY.md`.
+
+List every current case without native builds or measurements:
+
+```text
+gradlew.bat :tests:conformance:listComparisonCases
+```
+
+The Java examples are executable source files under `src/test/resources/fixtures`.
+For example, `GeneralPerformanceBenchmark.java` owns the actual timed loop and
+checksum output. Equivalent C++ code lives in `src/test/cpp/general_performance.cpp`.
+`ProjectComparison.java` orchestrates builds, and `BenchmarkScores.java` performs
+verification and starts measured processes. JUnit tests validate semantics and
+the harness; they do not assert that one implementation is faster.
+
+C++ references implement equivalent observable workloads with ordinary ownership
+and standard containers. Their memory management, exception/type-check contracts,
+iterators, layouts and container growth policies differ from Java. Report these
+limits alongside raw times; timings are not correctness assertions or evidence
+of general performance parity.
+
+For example, `general:list-grow` compares Java `ArrayList<String>` with MSVC's
+`std::vector<const std::u16string*>`. Each round creates and grows a fresh
+container. Assigning the new C++ owner destroys the previous vector inside the
+timer; Java reclamation follows GC scheduling, including any collections that
+occur during the sample. Final C++ destruction is outside the timer. Capacity
+growth and allocation policies also differ. Label this result as ArrayList
+versus the particular C++ vector implementation when interpreting it.
+
+GraalVM Native Image compiles the Java workload to native machine code, with
+its runtime and GC linked into the executable. Both comparator executables
+contain native code. Their language of origin does not establish their relative
+speed. Separating insertion into preallocated storage, capacity expansion and
+allocation/reclamation would require additional probes; the current combined
+timing does not attribute the observed gap to any one of these costs.
+
+The focused `compareListGrowth` task builds and measures three native
+list candidates while preserving the original `Cpp` vector reference:
+
+```text
+gradlew.bat :tests:conformance:compareListGrowth -PcomparisonTools=<absolute-properties-path> -PcomparisonRun=list-native-01
+```
+
+- `CppStack` holds vector metadata on the stack, starts with capacity ten and
+  subsequently grows normally.
+- `CppSmall` holds eight pointers inline, doubles capacity and uses `realloc`
+  after moving to heap storage. It uses a native list representation with a
+  different growth policy.
+- `CppSmall32` uses the same representation with 32 inline slots, trading a
+  larger stack-held container for fewer heap allocations on short lists.
+
+Every round appends the requested number of pointers to a fresh list; neither
+candidate reserves the final size, shares a pool across rounds or replaces the
+work with a checksum formula. Previous storage is reclaimed inside timing and
+final destruction is outside. Independent native checks cover element contents,
+empty lists, growth boundaries, moves and moved-from reuse. The last measured
+list's contents are also checked after stopping the timer. The usual independent
+small-input and exact-count JVM checksum checks apply before measurement.
+
+Results retain `CppMs` and add separately labelled `CppStackMs`, `CppSmallMs`
+and `CppSmall32Ms`.
+Calibration and measured process order include each eligible candidate. These
+variants participate only in `general:list-grow`; unrelated controls retain their
+ordinary implementations. Use `comparisonCases` to select general controls in
+the focused task. `compareImplementations` includes the candidates by default
+for general list growth; `comparisonCppTuning=false` selects the older reference
+alone for that case.
+These are tested optimization candidates; no universal optimum or required
+winning order is assumed. Other C++ workloads have not been tuned by this task.
+
+## Individual build and timing tasks
 
 `LookupIsolation` separates virtual hashing, same-object map hits, equal-but-distinct
 key hits, misses, replacement of an existing value, and reference scanning. Keys
@@ -7,7 +219,7 @@ the measured operations allocate no new entries. Each process runs one operation
 and size. These are diagnostic probes, not an overall performance score.
 
 The comparison tooling currently requires Windows, MSVC, CMake and a GraalVM
-installation with Native Image. TeaVM 0.16.0 is a declared Gradle dependency.
+installation with Native Image.
 Create a machine-specific properties file under this module's build directory:
 
 ```properties
@@ -23,8 +235,8 @@ gradlew.bat :tests:conformance:prepareLookupComparison -PlookupTools=<absolute-p
 ```
 
 This writes `build/lookup-comparison/baseline/benchmark.properties`, records input
-hashes and build logs, and compiles the same Java bytecode with jNative, GraalVM
-and TeaVM. A run name cannot overwrite an existing run.
+hashes and build logs, and compiles the same Java bytecode with jNative and
+GraalVM Native Image. A run name cannot overwrite an existing run.
 
 To compare an edited compiler, copy that generated properties file to another
 file under `build`, change `lookup.jNative` to `lookup.Baseline`, and choose a new
@@ -125,7 +337,7 @@ runtime file's hash in `prior-runtime.csv`. This assumes the compiler and classl
 are unchanged from the prior; it does not reconstruct an older compiler.
 
 Benchmark failures stop a run by default. After recording an unsupported input,
-`unavailable.TeaVM`, `unavailable.GraalVM` or `unavailable.Cpp` may explicitly name
+`unavailable.GraalVM` or `unavailable.Cpp` may explicitly name
 a case regex to omit that comparator for those inputs. The verification report
 lists every omission and its elapsed-time cells stay empty. An omission is not
 a verification pass and must be disclosed alongside the results.

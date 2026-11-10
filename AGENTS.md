@@ -30,8 +30,13 @@
 - Consult the history before repeating an experiment or restoring a rejected
   approach. Explain the changed hypothesis, inputs or evidence that justifies
   retrying; necessary correctness/regression checks are still expected.
-- Always compare jNative with GraalVM and TeaVM, and with C++ when an equivalent
-  workload exists. Performance claims in progress updates and final reports must
+- Own correctness tests, benchmark workloads and comparison runners in this
+  repository. Do not depend on libFDX, libGDX, gdx-teavm, sibling checkouts,
+  external application binaries, rendering backends, or their build helpers.
+  Installed compiler and toolchain dependencies are allowed.
+- Compare jNative with GraalVM Native Image and with C++ when an equivalent
+  workload exists. Do not include TeaVM C in the comparison workflow.
+  Performance claims in progress updates and final reports must
   include side-by-side raw timings for the other implementations; comparison with
   a previous jNative build is supplementary, not sufficient on its own.
 - State the remaining performance gap to the other implementations. If a

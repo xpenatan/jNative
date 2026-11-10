@@ -42,34 +42,37 @@ public final class BenchmarkScores {
     private static final List<String> MAP_PROBE = List.of("hash-erased", "hash-typed", "hash-object", "hash-identity",
             "hash-string", "get-object", "get-string", "get-collision4-same", "get-collision4-equal",
             "get-collision4-miss", "get-collision8-same", "get-collision8-equal", "get-collision8-miss");
-    private static final List<String> SPRITE = List.of("trig-cast", "scale-chain", "scale-fused",
-            "copy-array", "copy-scalar", "roots-cold", "roots-plain");
     private static final int SAMPLES = 5;
+    private static final int PILOT_SAMPLES = 3;
     private final int pairs;
     private final Properties config = new Properties();
+    private final BenchmarkCalibration calibration;
     private final Path output;
     private final Path classes;
     private final Map<String, Map<String, Path>> executables = new LinkedHashMap<>();
     private final List<Sample> samples = new ArrayList<>();
     private final List<Summary> summaries = new ArrayList<>();
     private final List<String> verification = new ArrayList<>();
-    private final Map<String, String> expectedChecksums = new LinkedHashMap<>();
+    private final Map<Case, String> expectedChecksums = new LinkedHashMap<>();
+    private final Map<Case, String> calibrationReasons = new LinkedHashMap<>();
+    private final StringBuilder calibrationRows = new StringBuilder(
+            "Suite,Operation,Size,Attempt,Rounds,Variant,MedianNs\n");
     private int sequence;
 
-    private record Case(String suite, String operation, int size, int rounds) {
+    record Case(String suite, String operation, int size, int rounds) {
         String key() { return suite + ":" + operation + ":" + size; }
         List<String> arguments(int count) {
-            return suite.equals("sprite")
-                    ? List.of("bench", operation, "" + rounds, "" + count, "false")
-                    : List.of(operation, "" + size, "" + rounds, "" + count);
+            return List.of(operation, "" + size, "" + rounds, "" + count);
         }
     }
     private record Sample(Case work, String variant, int pair, long nanos, String checksum) {}
     private record Summary(Case work, String variant, double median, double minimum, double maximum) {}
     private record Result(int exitCode, String text, String error) {}
+    record Reading(long nanos, String checksum) {}
 
     private BenchmarkScores(Path configuration, Path buildDirectory) throws Exception {
         try (var input = Files.newBufferedReader(configuration, StandardCharsets.UTF_8)) { config.load(input); }
+        calibration = BenchmarkCalibration.from(config);
         pairs = Integer.parseInt(config.getProperty("pairs", "4"));
         if (pairs < 1 || pairs > 32) throw new IllegalArgumentException("pairs must be between 1 and 32");
         String name = required("runName");
@@ -89,12 +92,11 @@ public final class BenchmarkScores {
 
     private void run() throws Exception {
         Instant started = Instant.now();
-        List<Case> selected = selectedCases();
+        List<Case> selected = selectedCases().stream().map(this::boundedInitialCase).toList();
         if (selected.isEmpty()) throw new IllegalArgumentException("The case filter selected no workloads");
         compileFixtures();
         if (selected.stream().anyMatch(work -> work.suite().equals("general"))) prepare("general", "GeneralPerformanceBenchmark");
         if (selected.stream().anyMatch(work -> work.suite().equals("identity"))) prepare("identity", "IdentityHashBenchmark");
-        if (selected.stream().anyMatch(work -> work.suite().equals("sprite"))) prepare("sprite", "SpriteOptimizationKernels");
         if (selected.stream().anyMatch(work -> work.suite().equals("lookup"))) prepare("lookup", "LookupIsolation");
         if (selected.stream().anyMatch(work -> work.suite().equals("map-probe"))) prepare("map-probe", "MapProbeIsolation");
         if (selected.stream().anyMatch(work -> work.suite().equals("allocation"))) prepare("allocation", "AllocationIsolation");
@@ -110,6 +112,12 @@ public final class BenchmarkScores {
                 binaries.append(csv(suite.getKey(), entry.getKey(), entry.getValue(), hash(entry.getValue())));
         Files.writeString(output.resolve("binaries.csv"), binaries);
         verify(selected);
+        if(calibration.enabled()) selected = calibrate(selected);
+        for(Case work : selected)
+            config.setProperty("rounds." + work.suite() + "." + work.operation() + "." + work.size(), Integer.toString(work.rounds()));
+        try(var writer = Files.newBufferedWriter(output.resolve("resolved-configuration.properties"))) {
+            config.store(writer, "Resolved identical work counts for every implementation; disable calibration to repeat exactly");
+        }
         for (Case work : selected) measure(work);
         writeComparisons();
         if (Boolean.parseBoolean(config.getProperty("profileGc", "false"))) profileGc();
@@ -117,7 +125,10 @@ public final class BenchmarkScores {
                 + "\nOS=" + System.getProperty("os.name") + " " + System.getProperty("os.version")
                 + "\nJava=" + System.getProperty("java.runtime.version")
                 + "\nProcessesPerVariant=" + pairs + "\nWarmups=3\nSamplesPerProcess=" + SAMPLES
-                + "\nCaseFilter=" + config.getProperty("cases", ".*")
+                + "\nCalibration=" + calibration.enabled() + "\nTargetSampleMillis=" + calibration.targetNanos() / 1_000_000
+                + "\nMaximumPilotSampleMillis=" + calibration.maximumNanos() / 1_000_000
+                + "\nRoundScaledSetupBudgetMiB=" + calibration.setupBytes() / (1024 * 1024)
+                + "\nCaseFilter=" + config.getProperty("cases", "general:.*")
                 + "\nAffinity=1\nGC=default\nOrder=forward/reverse alternating\n"
                 + "Timing=median of process medians, nanoseconds; lower is faster\n");
         System.out.println("Benchmark results: " + output);
@@ -125,6 +136,10 @@ public final class BenchmarkScores {
     }
 
     private List<Case> selectedCases() {
+        return cases(config);
+    }
+
+    static List<Case> cases(Properties config) {
         var cases = new ArrayList<Case>();
         for (String operation : GENERAL) {
             for (int size : List.of(16, 256, 4096)) {
@@ -139,7 +154,6 @@ public final class BenchmarkScores {
         for (String operation : List.of("identity-get", "object-get"))
             for (int size : List.of(16, 256, 4096))
                 cases.add(new Case("identity", operation, size, (int) Math.rint(2000000.0 / size)));
-        for (String operation : SPRITE) cases.add(new Case("sprite", operation, 256, 100000));
         for (String operation : LOOKUP)
             for (int size : List.of(16, 256, 4096))
                 cases.add(new Case("lookup", operation, size, (int) Math.rint(2000000.0 / size)));
@@ -177,11 +191,11 @@ public final class BenchmarkScores {
             for (int size : allocationSizes)
                 cases.add(new Case("allocation", operation, size, operation.endsWith("array")
                         ? Math.max(8, (int) Math.rint(2000000.0 / size)) : 262144));
-        return cases.stream().filter(work -> work.key().matches(config.getProperty("cases", ".*")))
-                .map(this::configuredRounds).toList();
+        return cases.stream().filter(work -> work.key().matches(config.getProperty("cases", "general:.*")))
+                .map(work -> configuredRounds(work, config)).toList();
     }
 
-    private Case configuredRounds(Case work) {
+    private static Case configuredRounds(Case work, Properties config) {
         String property = "rounds." + work.suite() + "." + work.operation() + "." + work.size();
         String value = config.getProperty(property);
         if (value == null) return work;
@@ -201,8 +215,8 @@ public final class BenchmarkScores {
         var arguments = new ArrayList<>(List.of("--release", "17", "-g", "-encoding", "UTF-8", "-d", classes.toString()));
         boolean lookup = selectedCases().stream().anyMatch(work -> work.suite().equals("lookup"));
         var fixtures = new ArrayList<String>();
-        if (selectedCases().stream().anyMatch(work -> List.of("general", "identity", "sprite").contains(work.suite())))
-            fixtures.addAll(List.of("GeneralPerformanceBenchmark", "IdentityHashBenchmark", "SpriteOptimizationKernels"));
+        if (selectedCases().stream().anyMatch(work -> work.suite().equals("general"))) fixtures.add("GeneralPerformanceBenchmark");
+        if (selectedCases().stream().anyMatch(work -> work.suite().equals("identity"))) fixtures.add("IdentityHashBenchmark");
         if (lookup) fixtures.add("LookupIsolation");
         if (selectedCases().stream().anyMatch(work -> work.suite().equals("map-probe"))) fixtures.add("MapProbeIsolation");
         if (selectedCases().stream().anyMatch(work -> work.suite().equals("allocation"))) fixtures.add("AllocationIsolation");
@@ -268,7 +282,7 @@ public final class BenchmarkScores {
             if (!Files.isRegularFile(executable)) throw new IllegalArgumentException("Missing executable: " + executable);
             variants.put("jNative", executable);
         }
-        for (String variant : List.of("GraalVM", "TeaVM", "Cpp", "CppAtomic", "Baseline", "Previous")) {
+        for (String variant : List.of("GraalVM", "Cpp", "CppStack", "CppSmall", "CppSmall32", "CppAtomic", "Baseline", "Previous")) {
             String value = config.getProperty(suite + "." + variant);
             if (value != null) {
                 Path executable = Path.of(value).toAbsolutePath();
@@ -276,7 +290,7 @@ public final class BenchmarkScores {
                 variants.put(variant, executable);
             }
         }
-        if (!variants.keySet().containsAll(List.of("jNative", "GraalVM", "TeaVM")))
+        if (!variants.keySet().containsAll(List.of("jNative", "GraalVM")))
             throw new IllegalArgumentException("Missing comparison implementations for " + suite);
         executables.put(suite, variants);
     }
@@ -303,7 +317,7 @@ public final class BenchmarkScores {
 
     private void verify(List<Case> selected) throws Exception {
         for (Case work : selected)
-            for (String variant : List.of("GraalVM", "TeaVM", "Cpp"))
+            for (String variant : List.of("GraalVM", "Cpp"))
                 if (unavailable(work, variant)) verification.add("Declared unavailable comparator: " + work.key() + " " + variant);
         verifyMapSuite(selected, "map-growth", "MapGrowthIsolation", MAP_GROWTH);
         verifyMapSuite(selected, "map-iteration", "MapIterationIsolation", MAP_ITERATION);
@@ -364,32 +378,136 @@ public final class BenchmarkScores {
             Result expected = jvm("GeneralPerformanceBenchmark", work.arguments(1));
             requireSuccess(expected);
             String checksum = expected.text().strip().split(",")[5];
-            for (var variant : executables.get("general").entrySet()) {
-                if (variant.getKey().equals("Cpp") && !generalCppSupports(operation)) continue;
-                Result actual = execute(variant.getValue(), work.arguments(1), "verify-" + variant.getKey());
+            for (String variant : variants(work)) {
+                Result actual = execute(executables.get("general").get(variant), work.arguments(1), "verify-" + variant);
                 requireSuccess(actual);
                 if (!actual.text().strip().split(",")[5].equals(checksum)) throw new IOException("JVM checksum mismatch: " + operation);
             }
         }
         if (executables.containsKey("general"))
             verification.add("Selected general operations: every implementation's small input checksums match the JVM.");
-        for (String suite : List.of("identity", "sprite")) {
+        for (String suite : List.of("identity")) {
             if (!executables.containsKey(suite)) continue;
-            String main = suite.equals("identity") ? "IdentityHashBenchmark" : "SpriteOptimizationKernels";
+            String main = "IdentityHashBenchmark";
             Result expected = jvm(main, List.of("verify"));
             requireSuccess(expected);
             for (var variant : executables.get(suite).entrySet()) {
                 Result actual = execute(variant.getValue(), List.of("verify"), "verify-" + suite + "-" + variant.getKey());
                 boolean same = actual.exitCode() == 0 && actual.error().isBlank() && actual.text().equals(expected.text());
                 verification.add(suite + " " + variant.getKey() + ": " + (same ? "PASS" : "FAIL, exit=" + actual.exitCode()));
-                // This retained TeaVM build fails a separate NaN-to-int edge case.
-                // Keep that limitation visible; measured input checksums must still match.
-                if (!same && !(suite.equals("sprite") && variant.getKey().equals("TeaVM")))
+                if (!same)
                     throw new IOException("Verification mismatch: " + suite + " " + variant.getKey());
             }
         }
+        for (Case work : selected) verifyExactCase(work);
+        verification.add("Every measured size and round count has a JVM reference checksum before timing.");
         Files.write(output.resolve("verification.txt"), verification, StandardCharsets.UTF_8);
         verification.forEach(System.out::println);
+    }
+
+    private void verifyExactCase(Case work) throws Exception {
+        String fixture = switch(work.suite()) {
+            case "general" -> "GeneralPerformanceBenchmark";
+            case "identity" -> "IdentityHashBenchmark";
+            case "lookup" -> "LookupIsolation";
+            case "map-probe" -> "MapProbeIsolation";
+            case "allocation" -> "AllocationIsolation";
+            case "map-growth" -> "MapGrowthIsolation";
+            case "map-iteration" -> "MapIterationIsolation";
+            case "nested-array" -> "NestedArrayIsolation";
+            case "runtime-cost" -> "RuntimeCostIsolation";
+            case "numeric" -> "NumericPipelineIsolation";
+            case "transfer" -> "TransferIsolation";
+            default -> throw new IllegalArgumentException("Unknown suite: " + work.suite());
+        };
+        Result expected = jvm(fixture, work.arguments(1));
+        requireSuccess(expected);
+        String checksum = parseOutput(expected.text(), work.operation(), work.size(), work.rounds(), 1).getFirst().checksum();
+        String previous = expectedChecksums.putIfAbsent(work, checksum);
+        if(previous != null && !previous.equals(checksum)) throw new IOException("Unstable JVM checksum: " + work);
+    }
+
+    static List<Reading> parseOutput(String text, String operation, int size, int rounds, int expectedCount) throws IOException {
+        var readings = new ArrayList<Reading>();
+        try {
+            for(String line : text.lines().toList()) {
+                String[] fields = line.split(",");
+                if(fields.length != 6 || !fields[0].equals("BENCH") || !fields[1].equals(operation)
+                        || Integer.parseInt(fields[2]) != size || Integer.parseInt(fields[3]) != rounds)
+                    throw new IOException("Invalid benchmark output: " + line);
+                long nanos = Long.parseLong(fields[4]);
+                if(nanos <= 0) throw new IOException("Nonpositive timing");
+                readings.add(new Reading(nanos, fields[5]));
+            }
+        } catch(NumberFormatException failure) {
+            throw new IOException("Invalid numeric benchmark output", failure);
+        }
+        if(readings.size() != expectedCount) throw new IOException("Unexpected sample count: " + readings.size());
+        return readings;
+    }
+
+    private List<Reading> checkedReadings(Result result, Case work, int count) throws IOException {
+        requireSuccess(result);
+        var readings = parseOutput(result.text(), work.operation(), work.size(), work.rounds(), count);
+        for(Reading reading : readings) checkChecksum(work, reading.checksum());
+        return readings;
+    }
+
+    private Case boundedInitialCase(Case work) {
+        if(!calibration.enabled()) return work;
+        int rounds = Math.min(work.rounds(), calibration.limit(work.suite(), work.operation(), work.size()).rounds());
+        return new Case(work.suite(), work.operation(), work.size(), rounds);
+    }
+
+    static boolean supportsListCandidate(Case work, String variant) {
+        return !List.of("CppStack", "CppSmall", "CppSmall32").contains(variant)
+                || work.suite().equals("general") && work.operation().equals("list-grow");
+    }
+
+    private List<String> variants(Case work) {
+        var variants = new ArrayList<>(executables.get(work.suite()).keySet());
+        variants.removeIf(variant -> !supportsListCandidate(work, variant));
+        if(work.suite().equals("general") && !generalCppSupports(work.operation())) variants.remove("Cpp");
+        variants.removeIf(variant -> unavailable(work, variant));
+        return variants;
+    }
+
+    private List<Case> calibrate(List<Case> selected) throws Exception {
+        var resolved = new ArrayList<Case>();
+        for(Case initial : selected) {
+            Case work = initial;
+            String reason = "attempt-limit";
+            for(int attempt = 1; attempt <= calibration.maximumAttempts(); attempt++) {
+                if(!expectedChecksums.containsKey(work)) verifyExactCase(work);
+                double fastest = Double.POSITIVE_INFINITY, slowest = 0;
+                var order = new ArrayList<>(variants(work));
+                if(attempt % 2 == 0) Collections.reverse(order);
+                for(String variant : order) {
+                    Result result = execute(executables.get(work.suite()).get(variant), work.arguments(PILOT_SAMPLES),
+                            "calibrate-" + work.suite() + "-" + work.operation() + "-" + work.size() + "-" + attempt + "-" + variant);
+                    double elapsed = median(checkedReadings(result, work, PILOT_SAMPLES).stream()
+                            .mapToDouble(Reading::nanos).toArray());
+                    fastest = Math.min(fastest, elapsed);
+                    slowest = Math.max(slowest, elapsed);
+                    calibrationRows.append(csv(work.suite(), work.operation(), work.size(), attempt, work.rounds(), variant, elapsed));
+                }
+                Files.writeString(output.resolve("calibration.csv"), calibrationRows);
+                var decision = calibration.next(work.rounds(), fastest, slowest,
+                        calibration.limit(work.suite(), work.operation(), work.size()));
+                if(!decision.repeat()) {
+                    reason = decision.reason();
+                    break;
+                }
+                if(attempt == calibration.maximumAttempts()) break;
+                work = new Case(work.suite(), work.operation(), work.size(), decision.rounds());
+            }
+            resolved.add(work);
+            calibrationReasons.put(work, reason);
+            System.out.println("Calibrated " + work.key() + ": " + work.rounds() + " shared rounds (" + reason + ")");
+        }
+        verification.add("Calibration pilots and final round counts match JVM checksums; pilots are excluded from reported samples.");
+        Files.write(output.resolve("verification.txt"), verification, StandardCharsets.UTF_8);
+        return resolved;
     }
 
     private Result jvm(String main, List<String> arguments) throws Exception {
@@ -443,42 +561,15 @@ public final class BenchmarkScores {
     }
 
     private void measure(Case work) throws Exception {
-        var variants = new ArrayList<>(executables.get(work.suite()).keySet());
-        if (work.suite().equals("general") && !generalCppSupports(work.operation())) variants.remove("Cpp");
-        variants.removeIf(variant -> unavailable(work, variant));
+        var variants = variants(work);
         for (int pair = 1; pair <= pairs; pair++) {
             var order = new ArrayList<>(variants);
             if (pair % 2 == 0) Collections.reverse(order);
             for (String variant : order) {
                 Result result = execute(executables.get(work.suite()).get(variant), work.arguments(SAMPLES),
                         work.suite() + "-" + work.operation() + "-" + work.size() + "-" + pair + "-" + variant);
-                requireSuccess(result);
-                int count = 0;
-                for (String line : result.text().lines().toList()) {
-                    String[] fields = line.split(",");
-                    long nanos;
-                    String checksum;
-                    if (work.suite().equals("sprite")) {
-                        if (fields[0].equals("CONFIG") || fields[0].equals("HEADER")) continue;
-                        if (fields.length != 6 || !fields[0].equals("SAMPLE")) throw new IOException("Invalid sprite output: " + line);
-                        checksum = fields[5];
-                        checkChecksum(work, checksum);
-                        if (fields[1].equals("warmup")) continue;
-                        if (!fields[1].equals("measure")) throw new IOException("Invalid phase: " + line);
-                        nanos = Long.parseLong(fields[3]);
-                    } else {
-                        if (fields.length != 6 || !fields[0].equals("BENCH") || !fields[1].equals(work.operation())
-                                || Integer.parseInt(fields[2]) != work.size() || Integer.parseInt(fields[3]) != work.rounds())
-                            throw new IOException("Invalid benchmark output: " + line);
-                        nanos = Long.parseLong(fields[4]);
-                        checksum = fields[5];
-                        checkChecksum(work, checksum);
-                    }
-                    if (nanos <= 0) throw new IOException("Nonpositive timing");
-                    samples.add(new Sample(work, variant, pair, nanos, checksum));
-                    count++;
-                }
-                if (count != SAMPLES) throw new IOException("Unexpected sample count: " + count);
+                for(Reading reading : checkedReadings(result, work, SAMPLES))
+                    samples.add(new Sample(work, variant, pair, reading.nanos(), reading.checksum()));
             }
         }
         for (String variant : variants) {
@@ -493,12 +584,13 @@ public final class BenchmarkScores {
             summaries.add(new Summary(work, variant, median(values), values[0], values[values.length - 1]));
         }
         writeResults();
-        System.out.println("Measured " + work.key() + "; checksums match.");
+        System.out.println("Measured " + work.key() + "; checksums match; " + durationStatus(work));
     }
 
     private void checkChecksum(Case work, String checksum) throws IOException {
-        String previous = expectedChecksums.putIfAbsent(work.key(), checksum);
-        if (previous != null && !previous.equals(checksum)) throw new IOException("Checksum mismatch: " + work.key());
+        String expected = expectedChecksums.get(work);
+        if(expected == null) throw new IOException("No JVM checksum for exact work count: " + work);
+        if(!expected.equals(checksum)) throw new IOException("Checksum mismatch: " + work);
     }
 
     private boolean generalCppSupports(String operation) {
@@ -508,7 +600,7 @@ public final class BenchmarkScores {
     // Failures are fatal by default. Explicitly documented unsupported inputs
     // can be excluded for a comparator while preserving the other raw timings.
     private boolean unavailable(Case work, String variant) {
-        return List.of("GraalVM", "TeaVM", "Cpp").contains(variant)
+        return List.of("GraalVM", "Cpp").contains(variant)
                 && work.key().matches(config.getProperty("unavailable." + variant, ""));
     }
 
@@ -533,20 +625,30 @@ public final class BenchmarkScores {
     }
 
     private void writeComparisons() throws IOException {
-        var timings = new StringBuilder("Suite,Operation,Size,Rounds,jNativeMs,PreviousJNativeMs,GraalVMMs,TeaVMMs,CppMs,jNativeTimeChangePercent\n");
+        var timings = new StringBuilder("Suite,Operation,Size,Rounds,jNativeMs,PreviousJNativeMs,GraalVMMs,CppMs,CppStackMs,CppSmallMs,CppSmall32Ms,jNativeTimeChangePercent,TargetSampleMs,DurationStatus\n");
         for (Summary current : summaries) {
             if (!current.variant().equals("jNative")) continue;
             Case work = current.work();
             var columns = new ArrayList<Object>(List.of(work.suite(), work.operation(), work.size(), work.rounds(), current.median() / 1e6));
-            for (String variant : List.of("Baseline", "GraalVM", "TeaVM", "Cpp")) {
+            for (String variant : List.of("Baseline", "GraalVM", "Cpp", "CppStack", "CppSmall", "CppSmall32")) {
                 Summary compared = summaries.stream().filter(s -> s.work().equals(work) && s.variant().equals(variant)).findFirst().orElse(null);
                 columns.add(compared == null ? "" : compared.median() / 1e6);
             }
             boolean hasBaseline = summaries.stream().anyMatch(s -> s.work().equals(work) && s.variant().equals("Baseline"));
             columns.add(hasBaseline ? 100 * (current.median() / summary(work, "Baseline").median() - 1) : "");
+            columns.add(calibration.targetNanos() / 1e6);
+            columns.add(durationStatus(work));
             timings.append(csv(columns.toArray()));
         }
         Files.writeString(output.resolve("timings.csv"), timings);
+    }
+
+    private String durationStatus(Case work) {
+        var observed = summaries.stream().filter(row -> row.work().equals(work)).toList();
+        boolean shortSample = observed.stream().anyMatch(row -> row.minimum() < calibration.targetNanos());
+        boolean longSample = observed.stream().anyMatch(row -> row.maximum() > calibration.maximumNanos());
+        String status = (shortSample ? "below-target" : "target-met") + (longSample ? ";above-budget" : "");
+        return status + " (" + calibrationReasons.getOrDefault(work, "fixed-rounds") + ")";
     }
 
     // Separate diagnostic processes after timing: statistics cover three warmups

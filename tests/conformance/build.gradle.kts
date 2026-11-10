@@ -4,15 +4,6 @@ plugins {
     java
 }
 
-repositories {
-    maven {
-        url = uri("https://teavm.org/maven/repository")
-        content {
-            includeGroupByRegex("org\\.teavm.*")
-        }
-    }
-}
-
 dependencies {
     testImplementation(project(":jNative:core"))
     testImplementation(project(":jNative:cli"))
@@ -21,9 +12,74 @@ dependencies {
     testImplementation(project(":samples:native-interop"))
     testImplementation(project(":samples:native-callbacks"))
     testImplementation(libs.junit.jupiter)
-    testImplementation("org.teavm:teavm-tooling:0.16.0")
-    testRuntimeOnly("org.teavm:teavm-classlib:0.16.0")
     testRuntimeOnly(libs.junit.platform.launcher)
+}
+
+tasks.register<JavaExec>("compareImplementations") {
+    group = "verification"
+    description = "Build, verify and compare project-owned Java and C++ workloads with jNative and GraalVM Native Image."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("com.github.xpenatan.jnative.conformance.ProjectComparison")
+    javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
+    systemProperty("jnative.comparison.calibrate", providers.gradleProperty("comparisonCalibrate").orElse("true").get())
+    systemProperty("jnative.comparison.targetMillis", providers.gradleProperty("comparisonMinSampleMillis").orElse("100").get())
+    systemProperty("jnative.comparison.maxSampleMillis", providers.gradleProperty("comparisonMaxSampleMillis").orElse("2000").get())
+    systemProperty("jnative.comparison.maxSetupMiB", providers.gradleProperty("comparisonMaxSetupMiB").orElse("64").get())
+    systemProperty("jnative.comparison.cppTuning", providers.gradleProperty("comparisonCppTuning").orElse("true").get())
+    args(
+        providers.gradleProperty("comparisonTools").orElse("").get(),
+        layout.buildDirectory.dir("compare").get().asFile.absolutePath,
+        providers.gradleProperty("comparisonRun").orElse("").get(),
+        providers.gradleProperty("comparisonSuite").orElse("all").get(),
+        layout.projectDirectory.dir("src/test/cpp").asFile.absolutePath,
+        providers.gradleProperty("comparisonCases").orElse(".*").get(),
+        providers.gradleProperty("comparisonProcesses").orElse("3").get(),
+        providers.gradleProperty("comparisonBaseline").orElse("").get()
+    )
+}
+
+tasks.register<JavaExec>("compareListGrowth") {
+    group = "verification"
+    description = "Verify and compare original and tuned C++ list growth with jNative and GraalVM Native Image."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("com.github.xpenatan.jnative.conformance.ProjectComparison")
+    javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
+    systemProperty("jnative.comparison.calibrate", providers.gradleProperty("comparisonCalibrate").orElse("true").get())
+    systemProperty("jnative.comparison.targetMillis", providers.gradleProperty("comparisonMinSampleMillis").orElse("100").get())
+    systemProperty("jnative.comparison.maxSampleMillis", providers.gradleProperty("comparisonMaxSampleMillis").orElse("2000").get())
+    systemProperty("jnative.comparison.maxSetupMiB", providers.gradleProperty("comparisonMaxSetupMiB").orElse("64").get())
+    systemProperty("jnative.comparison.cppTuning", "true")
+    args(
+        providers.gradleProperty("comparisonTools").orElse("").get(),
+        layout.buildDirectory.dir("compare").get().asFile.absolutePath,
+        providers.gradleProperty("comparisonRun").orElse("").get(),
+        "general",
+        layout.projectDirectory.dir("src/test/cpp").asFile.absolutePath,
+        providers.gradleProperty("comparisonCases").orElse("list-grow:.*").get(),
+        providers.gradleProperty("comparisonProcesses").orElse("3").get(),
+        providers.gradleProperty("comparisonBaseline").orElse("").get()
+    )
+}
+
+tasks.register<JavaExec>("listComparisonCases") {
+    group = "verification"
+    description = "List every project-owned benchmark operation, input size and default round count without native builds."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("com.github.xpenatan.jnative.conformance.ProjectComparison")
+    javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
+    args("--list")
+}
+
+tasks.register<JavaExec>("reportComparison") {
+    group = "verification"
+    description = "Show every selected case from a completed full benchmark in searchable HTML and combined CSV."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("com.github.xpenatan.jnative.conformance.ComparisonReport")
+    javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
+    args(
+        layout.buildDirectory.dir("compare").get().asFile.absolutePath,
+        providers.gradleProperty("comparisonRun").orElse("").get()
+    )
 }
 
 tasks.register<JavaExec>("benchmarkScores") {
@@ -40,7 +96,7 @@ tasks.register<JavaExec>("benchmarkScores") {
 
 tasks.register<JavaExec>("prepareLookupComparison") {
     group = "verification"
-    description = "Build identical isolated lookup inputs with jNative, GraalVM and TeaVM."
+    description = "Build identical isolated lookup inputs with jNative and GraalVM Native Image."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.github.xpenatan.jnative.conformance.BuildLookupComparisons")
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
@@ -53,7 +109,7 @@ tasks.register<JavaExec>("prepareLookupComparison") {
 
 tasks.register<JavaExec>("prepareNestedArrayComparison") {
     group = "verification"
-    description = "Build ordinary Java array probes with jNative, GraalVM and TeaVM."
+    description = "Build ordinary Java array probes with jNative and GraalVM Native Image."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.github.xpenatan.jnative.conformance.BuildLookupComparisons")
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
@@ -67,7 +123,7 @@ tasks.register<JavaExec>("prepareNestedArrayComparison") {
 
 tasks.register<JavaExec>("prepareRuntimeCostComparison") {
     group = "verification"
-    description = "Build reference-store and NIO probes with jNative, GraalVM and TeaVM."
+    description = "Build reference-store and NIO probes with jNative and GraalVM Native Image."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.github.xpenatan.jnative.conformance.BuildLookupComparisons")
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
@@ -81,7 +137,7 @@ tasks.register<JavaExec>("prepareRuntimeCostComparison") {
 
 tasks.register<JavaExec>("prepareNumericComparison") {
     group = "verification"
-    description = "Build library-independent field, lookup and packing probes with jNative, GraalVM and TeaVM."
+    description = "Build library-independent field, lookup and packing probes with jNative and GraalVM Native Image."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.github.xpenatan.jnative.conformance.BuildLookupComparisons")
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
@@ -95,7 +151,7 @@ tasks.register<JavaExec>("prepareNumericComparison") {
 
 tasks.register<JavaExec>("prepareTransferComparison") {
     group = "verification"
-    description = "Build matching array and typed-buffer transfer controls with jNative, GraalVM and TeaVM."
+    description = "Build matching array and typed-buffer transfer controls with jNative and GraalVM Native Image."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.github.xpenatan.jnative.conformance.BuildLookupComparisons")
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
@@ -169,7 +225,7 @@ tasks.register<JavaExec>("prepareNestedArrayCppComparison") {
 
 tasks.register<JavaExec>("prepareMapProbeComparison") {
     group = "verification"
-    description = "Build matching hashing and collision probes with jNative, GraalVM and TeaVM."
+    description = "Build matching hashing and collision probes with jNative and GraalVM Native Image."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.github.xpenatan.jnative.conformance.BuildLookupComparisons")
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
@@ -183,7 +239,7 @@ tasks.register<JavaExec>("prepareMapProbeComparison") {
 
 tasks.register<JavaExec>("prepareAllocationComparison") {
     group = "verification"
-    description = "Build matching allocation and object-lifetime probes with jNative, GraalVM and TeaVM."
+    description = "Build matching allocation and object-lifetime probes with jNative and GraalVM Native Image."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.github.xpenatan.jnative.conformance.BuildLookupComparisons")
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
@@ -197,7 +253,7 @@ tasks.register<JavaExec>("prepareAllocationComparison") {
 
 tasks.register<JavaExec>("prepareMapGrowthComparison") {
     group = "verification"
-    description = "Build isolated boxing, insertion and resize probes with jNative, GraalVM and TeaVM."
+    description = "Build isolated boxing, insertion and resize probes with jNative and GraalVM Native Image."
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.github.xpenatan.jnative.conformance.BuildLookupComparisons")
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
@@ -334,4 +390,8 @@ tasks.test {
         providers.gradleProperty("conformanceReleaseFlags").orElse("").get()
     )
     systemProperty("jnative.linux", providers.gradleProperty("nativeLinux").orElse("false").get())
+    systemProperty(
+        "jnative.comparison.sourceBaseline",
+        providers.gradleProperty("comparisonSourceBaseline").orElse("").get()
+    )
 }

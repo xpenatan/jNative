@@ -17,7 +17,7 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import javax.tools.ToolProvider;
 
-/** Preserves a new baseline and builds competitors from exactly the same class files. */
+/** Preserves a new baseline and builds Native Image from exactly the same class files. */
 public final class BuildLookupComparisons {
     private static int sequence;
 
@@ -26,6 +26,7 @@ public final class BuildLookupComparisons {
             throw new IllegalArgumentException("Use -PlookupTools=<properties> and a new -PlookupRun=<name>");
         String suite = args.length == 4 ? args[3] : "lookup";
         String main = switch (suite) {
+            case "general" -> "GeneralPerformanceBenchmark";
             case "lookup" -> "LookupIsolation";
             case "map-probe" -> "MapProbeIsolation";
             case "allocation" -> "AllocationIsolation";
@@ -49,7 +50,7 @@ public final class BuildLookupComparisons {
             Files.copy(input, source);
         }
         if (ToolProvider.getSystemJavaCompiler().run(null, null, null,
-                "--release", "17", "-g", "-d", classes.toString(), source.toString()) != 0)
+                "--release", "17", "-g", "-encoding", "UTF-8", "-d", classes.toString(), source.toString()) != 0)
             throw new IOException("Fixture compilation failed");
         StringBuilder hashes = new StringBuilder("File,SHA256\n");
         try (var files = Files.list(classes)) {
@@ -93,24 +94,12 @@ public final class BuildLookupComparisons {
                 + " --no-fallback -O3 -march=native --gc=serial -cp " + quote(classes)
                 + " -o " + quote(graal) + " " + main;
         run(output, List.of("cmd.exe", "/d", "/s", "/c", command), 600);
-        System.out.println("Built GraalVM lookup comparator.");
-        Path tea = Files.createDirectory(output.resolve("teavm"));
-        run(output, List.of(ProcessHarness.java(), "-cp", System.getProperty("java.class.path"),
-                CompileLookupTeaVm.class.getName(), classes.toString(), tea.resolve("generated").toString(), main), 300);
-        Files.writeString(tea.resolve("CMakeLists.txt"), """
-                cmake_minimum_required(VERSION 3.24)
-                project(lookup_teavm C)
-                add_executable(lookup_teavm generated/all.c)
-                set_property(TARGET lookup_teavm PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-                target_compile_options(lookup_teavm PRIVATE /O2 /Ob3 /fp:strict /wd4996 /wd4146)
-                """);
-        Path teaBuild = tea.resolve("native");
-        run(output, List.of("cmake", "-S", tea.toString(), "-B", teaBuild.toString(), "-G", generator), 120);
-        run(output, List.of("cmake", "--build", teaBuild.toString(), "--config", "Release", "--parallel", "2"), 300);
+        System.out.println("Built GraalVM " + suite + " comparator.");
         var config = new Properties();
         config.setProperty("runName", suite + "-" + args[2]);
         config.setProperty("generator", generator);
         String referenceKey = switch (suite) {
+            case "general" -> "reference.classes";
             case "lookup" -> "reference.lookupClasses";
             case "map-probe" -> "reference.mapProbeClasses";
             case "allocation" -> "reference.allocationClasses";
@@ -126,7 +115,6 @@ public final class BuildLookupComparisons {
         config.setProperty(suite + ".jNative", nativeResult.executable().toString());
         if (priorExecutable != null) config.setProperty(suite + ".Baseline", priorExecutable.toString());
         config.setProperty(suite + ".GraalVM", graal + ".exe");
-        config.setProperty(suite + ".TeaVM", teaBuild.resolve("Release/lookup_teavm.exe").toString());
         config.setProperty("cases", suite + ":.*");
         config.setProperty("pairs", "6");
         config.setProperty("profileGc", "true");

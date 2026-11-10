@@ -51,11 +51,37 @@ public final class BuildMapCppComparison {
                     target_compile_options(runtime_cost_atomic_cpp PRIVATE -O3)
                 endif()
                 """, StandardOpenOption.APPEND);
+        boolean tunedLists = suite.equals("general") && Boolean.getBoolean("jnative.comparison.cppTuning");
+        if(tunedLists) {
+            appendListCandidate(output, "general_stack_cpp", "JNATIVE_LIST_STACK");
+            appendListCandidate(output, "general_small_cpp", "JNATIVE_LIST_SMALL");
+            appendListCandidate(output, "general_small32_cpp", "JNATIVE_LIST_SMALL JNATIVE_LIST_INLINE_CAPACITY=32");
+        }
         Path nativeOutput = output.resolve("native");
         BuildLookupComparisons.run(output, List.of("cmake", "-S", output.toString(), "-B", nativeOutput.toString(),
                 "-G", args[2], "-DCMAKE_BUILD_TYPE=Release"), 120);
         BuildLookupComparisons.run(output, List.of("cmake", "--build", nativeOutput.toString(), "--config", "Release",
                 "--parallel", "2"), 120);
+        if(tunedLists) {
+            BuildLookupComparisons.run(output, List.of(nativeOutput.resolve("Release/general_stack_cpp.exe").toString(), "--verify-list"), 60);
+            BuildLookupComparisons.run(output, List.of(nativeOutput.resolve("Release/general_small_cpp.exe").toString(), "--verify-list"), 60);
+            BuildLookupComparisons.run(output, List.of(nativeOutput.resolve("Release/general_small32_cpp.exe").toString(), "--verify-list"), 60);
+            System.out.println("All native list candidates pass element, boundary and move-ownership verification.");
+        }
         System.out.println("C++ probe build: " + nativeOutput);
+    }
+
+    private static void appendListCandidate(Path output, String target, String definition) throws Exception {
+        Files.writeString(output.resolve("CMakeLists.txt"), """
+                add_executable(%1$s probe.cpp)
+                target_compile_features(%1$s PRIVATE cxx_std_17)
+                target_compile_definitions(%1$s PRIVATE %2$s)
+                set_property(TARGET %1$s PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+                if(MSVC)
+                    target_compile_options(%1$s PRIVATE /O2 /Ob3 /fp:strict)
+                else()
+                    target_compile_options(%1$s PRIVATE -O3)
+                endif()
+                """.formatted(target, definition), StandardOpenOption.APPEND);
     }
 }
